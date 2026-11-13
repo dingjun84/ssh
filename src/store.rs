@@ -153,6 +153,43 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Rewrites a session in place. The secret is untouched — that lives in the
+    /// Keychain and is only replaced when the user types a new one.
+    pub fn update(&self, id: i64, session: &NewSession) -> Result<(), String> {
+        let group_id = self.ensure_group(&session.group)?;
+        let changed = self
+            .conn
+            .execute(
+                r#"
+                UPDATE sessions
+                   SET group_id = ?1, label = ?2, host = ?3, port = ?4,
+                       user = ?5, auth_kind = ?6, key_path = ?7
+                 WHERE id = ?8
+                "#,
+                params![
+                    group_id,
+                    session.label,
+                    session.host,
+                    session.port as i64,
+                    session.user,
+                    match session.auth {
+                        AuthKind::Key { .. } => "key",
+                        AuthKind::Password => "password",
+                    },
+                    match &session.auth {
+                        AuthKind::Key { path } => Some(path.clone()),
+                        AuthKind::Password => None,
+                    },
+                    id,
+                ],
+            )
+            .map_err(|e| format!("更新会话失败: {e}"))?;
+        if changed == 0 {
+            return Err(format!("会话 {id} 不存在"));
+        }
+        Ok(())
+    }
+
     pub fn delete(&self, id: i64) -> Result<(), String> {
         self.conn
             .execute("DELETE FROM sessions WHERE id = ?1", params![id])
@@ -325,6 +362,48 @@ mod tests {
         let path = dir.path().join("s.db");
         let store = Store::open(&path).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn update_moves_group_and_switches_auth() {
+        let (_dir, store) = temp_store();
+        let id = store
+            .insert(&NewSession {
+                group: "生产".into(),
+                label: "old".into(),
+                host: "a".into(),
+                port: 22,
+                user: "root".into(),
+                auth: AuthKind::Key {
+                    path: "~/.ssh/id_rsa".into(),
+                },
+            })
+            .unwrap();
+
+        store
+            .update(
+                id,
+                &NewSession {
+                    group: "测试".into(),
+                    label: "new".into(),
+                    host: "b".into(),
+                    port: 2200,
+                    user: "deploy".into(),
+                    auth: AuthKind::Password,
+                },
+            )
+            .unwrap();
+
+        let updated = store.get(id).unwrap().unwrap();
+        assert_eq!(updated.group, "测试");
+        assert_eq!(updated.label, "new");
+        assert_eq!(updated.host, "b");
+        assert_eq!(updated.port, 2200);
+        assert_eq!(updated.auth, AuthKind::Password);
+
+        // The old group is left behind only because it is now empty; it must
+        // not be deleted out from under other sessions.
+        assert_eq!(store.groups().unwrap().len(), 1);
     }
 
     #[test]

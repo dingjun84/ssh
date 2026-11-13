@@ -75,6 +75,7 @@ Sublime2 风格的 Monokai 配色：左侧会话树 + 顶部标签栏 + 主区�
 - 密码/私钥口令进 macOS 登录钥匙串：`service=ssh-client`，`account=session:<id>:password|passphrase`（`security-framework` 的 `passwords` 模块）
 - 首次启动自动播种一条开发主机（`43.139.142.161` / root / `~/.ssh/id_rsa`）
 - 侧栏改成数据驱动：分组 → 会话，点开自动去重（同会话只开一个标签）。右侧抽屉是"添加会话"表单，`×` 走二次确认删除并清理钥匙串条目
+- 行尾 `✎` 打开同一个抽屉做**编辑**：字段预填，密码/口令栏永远空着，留空即"不改动钥匙串里的值"；保存后已开标签页的标题跟着改
 - 库打不开时退化为内存库并在侧栏顶部给出警告，不让整个 app 起不来
 
 ### 6. 主机指纹校验（`src/hostkey.rs`）
@@ -100,7 +101,6 @@ Sublime2 风格的 Monokai 配色：左侧会话树 + 顶部标签栏 + 主区�
 | 优先级 | 事项 | 说明 |
 |---|---|---|
 | P0 | 复制粘贴 | 代码层面已具备：`view.rs` 有 clipboard 读写，`bindings.rs` 绑了 ⌘C/⌘V，但**没有手动敲键验证过**（当前测试环境点不到窗口，也没法按键）。真机自测一遍再划掉 |
-| P0 | 编辑已有会话 | 现在只能新建/删除，改分组或换私钥得删了重建 |
 | P1 | SFTP 面板 | 复用同一个连接开 sftp subsystem，双栏 + 拖拽 + 传输队列 |
 | P1 | `~/.ssh/config` 导入 | 解析 Host/HostName/User/Port/IdentityFile/ProxyJump，批量灌进会话库 |
 | P1 | ProxyJump / 端口转发 | 生产环境必需 |
@@ -142,6 +142,8 @@ SSH_AUTOCONNECT=1 SSH_PROBE="hostname; echo FP_OK" ./target/debug/ssh-client &
 
 # 3. 只看"添加会话"表单布局（不需要点按钮）
 SSH_OPEN_FORM=1 ./target/debug/ssh-client &
+# 编辑已有会话的表单（用第一条会话预填）
+SSH_OPEN_FORM=edit ./target/debug/ssh-client &
 
 # 4. 连上后自动在远端执行一段命令（验证写入方向）
 SSH_PROBE="stty size" SSH_AUTOCONNECT=1 ./target/debug/ssh-client &
@@ -155,7 +157,7 @@ WRITE_MODE=split ./target/debug/rsstest
 cargo test
 ```
 
-可用的测试环境变量：`SSH_CLIENT_DB`（换库文件）、`SSH_KNOWN_HOSTS`（换 known_hosts）、`SSH_AUTOCONNECT`（自动开第一个会话）、`SSH_OPEN_FORM`（自动打开添加表单）、`SSH_PROBE`（连上后往远端敲一条命令）。
+可用的测试环境变量：`SSH_CLIENT_DB`（换库文件）、`SSH_KNOWN_HOSTS`（换 known_hosts）、`SSH_AUTOCONNECT`（自动开第一个会话）、`SSH_OPEN_FORM`（自动打开表单，`=edit` 走编辑模式）、`SSH_PROBE`（连上后往远端敲一条命令）。
 
 `src/bin/rsstest.rs` 是刻意保留的诊断工具：最小 russh 连接 + 两种写入策略，用来区分"库的问题"和"我的集成问题"。别删。
 
@@ -200,9 +202,18 @@ cargo test
 | `connect_count` 计数 | 通过（一次首连 + 一次重连 = 17→19） |
 | 关标签页不再 panic | 通过（原先 `terminal event channel closed unexpected` 会让整个 UI 卡死） |
 
+### 编辑会话（2026-11-13 第四轮）
+
+| 项 | 结果 |
+|---|---|
+| 编辑表单预填 | 通过（`SSH_OPEN_FORM=edit`：标题"编辑会话"，名称/主机/端口/用户/分组/私钥路径全部带出） |
+| 口令栏语义 | 通过（标签"新私钥口令（留空不改）"，不把钥匙串里的值读回表单） |
+| 改分组 + 换认证方式的落库 | 通过（单测 `update_moves_group_and_switches_auth`：group/label/host/port/auth 全部生效） |
+| 行尾 `✎` / `×` 入口 | 通过（两个 10px 图标按钮，删除仍走二次确认） |
+
 ## 下一步建议
 
-P0 只剩两件：**编辑已有会话**（改分组/换私钥，别逼人删了重建）和**真机验证 ⌘C/⌘V**。
+P0 只剩一件：**真机验证 ⌘C/⌘V**（代码已经有了，只差人手敲一遍）。
 之后上 SFTP：复用同一条连接开 `sftp` subsystem，别另起连接。
 
 再往下值得考虑的：状态栏双指标（协议层 RTT + 终端最后输出时间），因为 keepalive 通不代表 shell 活着——

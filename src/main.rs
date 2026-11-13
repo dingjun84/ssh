@@ -173,6 +173,8 @@ enum DraftField {
 
 #[derive(Debug, Clone)]
 struct Draft {
+    /// `Some` when the drawer is editing an existing row.
+    editing: Option<i64>,
     group: String,
     label: String,
     host: String,
@@ -180,7 +182,8 @@ struct Draft {
     user: String,
     use_key: bool,
     key_path: String,
-    /// Password or key passphrase, depending on `use_key`.
+    /// Password or key passphrase, depending on `use_key`. When editing, an
+    /// empty value means "keep the stored secret".
     secret: String,
     error: Option<String>,
 }
@@ -188,6 +191,7 @@ struct Draft {
 impl Draft {
     fn new(group: Option<&str>) -> Self {
         Draft {
+            editing: None,
             group: group.unwrap_or("生产环境").to_string(),
             label: String::new(),
             host: String::new(),
@@ -197,6 +201,35 @@ impl Draft {
             key_path: "~/.ssh/id_rsa".into(),
             secret: String::new(),
             error: None,
+        }
+    }
+
+    /// Prefills the drawer from an existing row. The secret is never read back
+    /// into the form — it stays in the Keychain until deliberately replaced.
+    fn from_session(session: &Session) -> Self {
+        let (use_key, key_path) = match &session.auth {
+            AuthKind::Key { path } => (true, path.clone()),
+            AuthKind::Password => (false, String::new()),
+        };
+        Draft {
+            editing: Some(session.id),
+            group: session.group.clone(),
+            label: session.label.clone(),
+            host: session.host.clone(),
+            port: session.port.to_string(),
+            user: session.user.clone(),
+            use_key,
+            key_path,
+            secret: String::new(),
+            error: None,
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        if self.editing.is_some() {
+            "编辑会话"
+        } else {
+            "新建会话"
         }
     }
 
@@ -267,6 +300,7 @@ enum Message {
     SelectTab(usize),
     CloseTab(usize),
     NewSession,
+    EditSession(i64),
     DraftEdited(DraftField, String),
     DraftAuth(bool),
     DraftSave,
@@ -346,9 +380,18 @@ impl App {
         }
 
         // Same idea for the session form, which otherwise needs a click.
-        if std::env::var("SSH_OPEN_FORM").is_ok() {
+        // `SSH_OPEN_FORM=edit` prefills it from the first session.
+        if let Ok(form) = std::env::var("SSH_OPEN_FORM") {
             let group = app.groups.first().map(|(name, _)| name.clone());
-            app.draft = Some(Draft::new(group.as_deref()));
+            app.draft = Some(if form == "edit" {
+                app.groups
+                    .first()
+                    .and_then(|(_, list)| list.first())
+                    .map(Draft::from_session)
+                    .unwrap_or_else(|| Draft::new(group.as_deref()))
+            } else {
+                Draft::new(group.as_deref())
+            });
         }
         (app, Task::none())
     }
@@ -718,7 +761,8 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
             let Some(draft) = state.draft.clone() else {
                 return Task::none();
             };
-            let new_session = match draft.into_new_session() {
+            let edited = draft.into_new_session();
+            let new_session = match edited {
                 Ok(session) => session,
                 Err(err) => {
                     if let Some(draft) = &mut state.draft {
@@ -728,17 +772,29 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
                 },
             };
 
-            let id = match state.store.insert(&new_session) {
-                Ok(id) => id,
-                Err(err) => {
-                    if let Some(draft) = &mut state.draft {
-                        draft.error = Some(err);
-                    }
-                    return Task::none();
+            let id = match draft.editing {
+                Some(id) => match state.store.update(id, &new_session) {
+                    Ok(()) => id,
+                    Err(err) => {
+                        if let Some(draft) = &mut state.draft {
+                            draft.error = Some(err);
+                        }
+                        return Task::none();
+                    },
+                },
+                None => match state.store.insert(&new_session) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        if let Some(draft) = &mut state.draft {
+                            draft.error = Some(err);
+                        }
+                        return Task::none();
+                    },
                 },
             };
 
-            // Secrets go to the Keychain, keyed by the row id we just got.
+            // Secrets go to the Keychain, keyed by the row id we just got. An
+            // empty field while editing means "leave the stored one alone".
             let secret_result = if draft.secret.is_empty() {
                 Ok(())
             } else if draft.use_key {
@@ -750,16 +806,29 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
                 if let Some(draft) = &mut state.draft {
                     draft.error = Some(err);
                 }
-                // The session row exists already; keep it so the user can fix
-                // the secret by re-saving instead of retyping everything.
+                // The row is already saved; keep the form open so the user can
+                // fix the secret without retyping everything.
                 state.reload_groups();
                 return Task::none();
             }
 
             state.draft = None;
+            // Rename open tabs so the title tracks the edited label.
+            for tab in &mut state.tabs {
+                if tab.session_id == Some(id) {
+                    tab.title = new_session.label.clone();
+                }
+            }
             state.reload_groups();
         },
         Message::DraftClose => state.draft = None,
+        Message::EditSession(id) => {
+            if let Some(session) = state.find_session(id) {
+                state.draft = Some(Draft::from_session(&session));
+                state.pending_delete = None;
+                return iced::widget::operation::focus(draft_input_id(DraftField::Label));
+            }
+        },
         Message::AskDelete(id) => state.pending_delete = Some(id),
         Message::CancelDelete => state.pending_delete = None,
         Message::ConfirmDelete => {
@@ -933,9 +1002,13 @@ fn sidebar(state: &App) -> Element<'_, Message> {
                         .on_press(Message::OpenSession(session.id))
                         .width(Length::Fill)
                         .style(flat_button),
+                    button(text("✎").size(10).color(DIM))
+                        .on_press(Message::EditSession(session.id))
+                        .padding([2, 3])
+                        .style(ghost_button),
                     button(text("×").size(11).color(DIM))
                         .on_press(Message::AskDelete(session.id))
-                        .padding([2, 4])
+                        .padding([2, 3])
                         .style(ghost_button),
                 ]
                 .spacing(0)
@@ -1048,7 +1121,7 @@ fn form_panel(state: &App) -> Element<'_, Message> {
     .spacing(2);
 
     let mut col = column![
-        text("新建会话").size(12).color(FG),
+        text(draft.title()).size(12).color(FG),
         input_field("名称（留空用主机名）", &draft.label, DraftField::Label, "prod-web-01", false),
         input_field("主机", &draft.host, DraftField::Host, "10.0.0.1 或 example.com", false),
         row![
@@ -1077,12 +1150,14 @@ fn form_panel(state: &App) -> Element<'_, Message> {
             false,
         ));
     }
+    let secret_title = match (draft.editing.is_some(), draft.use_key) {
+        (true, true) => "新私钥口令（留空不改）",
+        (true, false) => "新密码（留空不改）",
+        (false, true) => "私钥口令（没有就留空）",
+        (false, false) => "密码（存入钥匙串）",
+    };
     col = col.push(input_field(
-        if draft.use_key {
-            "私钥口令（没有就留空）"
-        } else {
-            "密码（存入钥匙串）"
-        },
+        secret_title,
         &draft.secret,
         DraftField::Secret,
         "••••••••",
