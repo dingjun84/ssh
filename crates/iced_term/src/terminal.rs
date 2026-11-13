@@ -102,6 +102,15 @@ impl Terminal {
         self.redraw();
     }
 
+    /// Re-attaches the terminal to a new transport without touching the VT
+    /// state. Reconnecting an SSH session uses this instead of building a new
+    /// `Terminal`: the scrollback survives, and — more importantly — dropping a
+    /// `Terminal` closes its event channel, which used to panic the
+    /// subscription stream.
+    pub fn set_transport(&mut self, transport: std::sync::Arc<dyn backend::Transport>) {
+        self.backend.set_transport(transport);
+    }
+
     pub fn subscription(&self) -> Subscription<Event> {
         let data = TerminalSubscriptionData {
             id: self.id,
@@ -168,15 +177,10 @@ fn terminal_subscription_stream(
     let id = data.id;
     let event_receiver = data.event_receiver.clone();
     iced::stream::channel(1000, async move |mut output| {
-        let mut shutdown = false;
         loop {
             let mut event_receiver = event_receiver.lock().await;
             match event_receiver.recv().await {
                 Some(event) => {
-                    if let AlacrittyEvent::Exit = event {
-                        shutdown = true
-                    };
-
                     output
                         .send(Event::BackendCall(id, backend::Command::ProcessAlacrittyEvent(event)))
                         .await
@@ -185,9 +189,10 @@ fn terminal_subscription_stream(
                         });
                 },
                 None => {
-                    if !shutdown {
-                        panic!("iced_term stream {}: terminal event channel closed unexpected", id);
-                    }
+                    // Channel closed because the `Terminal` was dropped (tab
+                    // closed). Ending the stream is the correct outcome; the
+                    // upstream `panic!` here wedged the entire UI event loop.
+                    break;
                 },
             }
         }

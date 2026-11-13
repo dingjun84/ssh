@@ -267,9 +267,15 @@ impl Backend {
         }
     }
 
+    /// Points the outbound sink at a new transport. Used when a remote session
+    /// reconnects: the VT state (and its scrollback) survives, only the pipe
+    /// underneath is replaced.
+    pub fn set_transport(&mut self, transport: Arc<dyn Transport>) {
+        self.sink = Sink::Remote(transport);
+    }
+
     /// Feeds raw bytes received from the remote side into the VT parser.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        // Clone the Arc so the parser (borrowed from self) and the terminal
+    pub fn feed(&mut self, bytes: &[u8]) {        // Clone the Arc so the parser (borrowed from self) and the terminal
         // guard (borrowed from the Arc) do not conflict.
         let term = self.term.clone();
         let mut term = term.lock();
