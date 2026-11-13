@@ -572,16 +572,9 @@ impl Backend {
     }
 
     pub fn selectable_content(&self) -> String {
-        let content = self.renderable_content();
-        let mut result = String::new();
-        if let Some(range) = content.selectable_range {
-            for indexed in content.grid.display_iter() {
-                if range.contains(indexed.point) {
-                    result.push(indexed.c);
-                }
-            }
-        }
-        result
+        // The VT core handles wide-character spacers, wrapped lines, trailing
+        // blanks and scrollback. Concatenating visible cells loses all four.
+        self.term.lock().selection_to_string().unwrap_or_default()
     }
 
     pub fn sync(&mut self) {

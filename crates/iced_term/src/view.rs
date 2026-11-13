@@ -38,6 +38,16 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// Terminals send CR for Enter. Bracketed paste preserves newlines and strips
+/// ESC so clipboard text cannot prematurely terminate the paste bracket.
+fn paste_bytes(text: &str, mode: TermMode) -> Vec<u8> {
+    if mode.contains(TermMode::BRACKETED_PASTE) {
+        format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")).into_bytes()
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+    }
+}
+
 pub struct TerminalView<'a> {
     term: &'a Terminal,
 }
@@ -321,7 +331,7 @@ impl<'a> TerminalView<'a> {
         state: &mut TerminalViewState,
         clipboard: &mut dyn iced_graphics::core::Clipboard,
         event: &iced::keyboard::Event,
-    ) -> Option<Command> {
+    ) -> (Option<Command>, bool) {
         let mut binding_action = BindingAction::Ignore;
         let last_content = self.term.backend.renderable_content();
         match event {
@@ -332,41 +342,51 @@ impl<'a> TerminalView<'a> {
                 } else {
                     LinkAction::Clear
                 };
-                return Some(Command::ProcessLink(
-                    action,
-                    state.mouse_position_on_grid,
-                ));
+                return (
+                    Some(Command::ProcessLink(action, state.mouse_position_on_grid)),
+                    false,
+                );
             },
             iced::keyboard::Event::KeyPressed {
                 key,
                 modifiers,
                 text,
                 ..
-            } => match &key {
-                // Use the physical character key for bindings even when text is None (e.g., Ctrl/Cmd combos)
-                Key::Character(k) => {
-                    let lower = k.to_ascii_lowercase();
-                    binding_action = self.term.bindings.get_action(
-                        InputKind::Char(lower),
-                        state.keyboard_modifiers,
-                        last_content.terminal_mode,
-                    );
+            } => {
+                // Focus changes can hide ModifiersChanged events. The key
+                // event's modifiers are authoritative for every binding.
+                state.keyboard_modifiers = *modifiers;
+                match &key {
+                    // Bind logical keys even when Ctrl/Cmd produces no text.
+                    Key::Character(k) => {
+                        let lower = k.to_ascii_lowercase();
+                        binding_action = self.term.bindings.get_action(
+                            InputKind::Char(lower),
+                            *modifiers,
+                            last_content.terminal_mode,
+                        );
 
-                    // If no binding matched, only write printable text (when provided)
-                    if binding_action == BindingAction::Ignore {
-                        if let Some(c) = text {
-                            return Some(Command::Write(c.as_bytes().to_vec()));
+                        if binding_action == BindingAction::Ignore
+                            && !modifiers.command()
+                            && !modifiers.control()
+                        {
+                            if let Some(c) = text {
+                                return (
+                                    Some(Command::Write(c.as_bytes().to_vec())),
+                                    true,
+                                );
+                            }
                         }
-                    }
-                },
-                Key::Named(code) => {
-                    binding_action = self.term.bindings.get_action(
-                        InputKind::KeyCode(*code),
-                        *modifiers,
-                        last_content.terminal_mode,
-                    );
-                },
-                _ => {},
+                    },
+                    Key::Named(code) => {
+                        binding_action = self.term.bindings.get_action(
+                            InputKind::KeyCode(*code),
+                            *modifiers,
+                            last_content.terminal_mode,
+                        );
+                    },
+                    _ => {},
+                }
             },
             _ => {},
         }
@@ -375,27 +395,35 @@ impl<'a> TerminalView<'a> {
             BindingAction::Char(c) => {
                 let mut buf = [0, 0, 0, 0];
                 let str = c.encode_utf8(&mut buf);
-                return Some(Command::Write(str.as_bytes().to_vec()));
+                return (Some(Command::Write(str.as_bytes().to_vec())), true);
             },
             BindingAction::Esc(seq) => {
-                return Some(Command::Write(seq.as_bytes().to_vec()));
+                return (Some(Command::Write(seq.as_bytes().to_vec())), true);
             },
             BindingAction::Paste => {
                 if let Some(data) = clipboard.read(ClipboardKind::Standard) {
-                    let input: Vec<u8> = data.bytes().collect();
-                    return Some(Command::Write(input));
+                    if !data.is_empty() {
+                        return (
+                            Some(Command::Write(paste_bytes(
+                                &data, last_content.terminal_mode,
+                            ))),
+                            true,
+                        );
+                    }
                 }
+                return (None, true);
             },
             BindingAction::Copy => {
-                clipboard.write(
-                    ClipboardKind::Standard,
-                    self.term.backend.selectable_content(),
-                );
+                let selected = self.term.backend.selectable_content();
+                if !selected.is_empty() {
+                    clipboard.write(ClipboardKind::Standard, selected);
+                }
+                return (None, true);
             },
             _ => {},
         };
 
-        None
+        (None, false)
     }
 }
 
@@ -695,9 +723,12 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
                     return;
                 }
 
-                self.handle_keyboard_event(state, clipboard, keyboard_event)
-                    .into_iter()
-                    .collect()
+                let (command, handled) =
+                    self.handle_keyboard_event(state, clipboard, keyboard_event);
+                if handled {
+                    shell.capture_event();
+                }
+                command.into_iter().collect()
             },
             _ => Vec::new(),
         };
@@ -862,6 +893,146 @@ impl BackgroundRect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod clipboard_tests {
+        use super::*;
+        use iced_core::keyboard::{key, Location};
+        use std::sync::Arc;
+
+        struct NoTransport;
+        impl crate::Transport for NoTransport {
+            fn write(&self, _: &[u8]) {}
+            fn resize(&self, _: u16, _: u16) {}
+        }
+
+        struct Clipboard(Option<String>);
+        impl iced_core::Clipboard for Clipboard {
+            fn read(&self, _: ClipboardKind) -> Option<String> {
+                self.0.clone()
+            }
+            fn write(&mut self, _: ClipboardKind, text: String) {
+                self.0 = Some(text);
+            }
+        }
+
+        fn terminal() -> Terminal {
+            let mut term = Terminal::new_remote(
+                1, Default::default(), Arc::new(NoTransport),
+            );
+            term.backend.handle(Command::Resize(
+                Some(Size::new(800.0, 240.0)), Some(Size::new(10.0, 20.0)),
+            ));
+            term
+        }
+
+        fn key(character: &str, modifiers: Modifiers) -> iced::keyboard::Event {
+            iced::keyboard::Event::KeyPressed {
+                key: Key::Character(character.into()),
+                modified_key: Key::Character(character.into()),
+                physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+                location: Location::Standard,
+                modifiers,
+                text: Some(character.into()),
+                repeat: false,
+            }
+        }
+
+        #[test]
+        fn ordinary_paste_normalizes_newlines_without_doubling_crlf() {
+            assert_eq!(paste_bytes("中文\r\nnext\nlast\r", TermMode::empty()),
+                "中文\rnext\rlast\r".as_bytes());
+        }
+
+        #[test]
+        fn bracketed_paste_preserves_newlines_and_cannot_escape_brackets() {
+            assert_eq!(paste_bytes("中文\n\x1b[201~oops", TermMode::BRACKETED_PASTE),
+                "\x1b[200~中文\n[201~oops\x1b[201~".as_bytes());
+        }
+
+        #[test]
+        fn ctrl_c_still_interrupts_and_unbound_command_does_not_type() {
+            let term = terminal();
+            let view = TerminalView { term: &term };
+            let mut state = TerminalViewState::new();
+            let mut clipboard = Clipboard(Some("unchanged".into()));
+            let (command, handled) = view.handle_keyboard_event(
+                &mut state, &mut clipboard, &key("c", Modifiers::CTRL),
+            );
+            assert!(handled);
+            assert!(matches!(command, Some(Command::Write(data)) if data == b"\x03"));
+            let (command, handled) = view.handle_keyboard_event(
+                &mut state, &mut clipboard, &key("q", Modifiers::COMMAND),
+            );
+            assert!(!handled);
+            assert!(command.is_none());
+            assert_eq!(clipboard.0.as_deref(), Some("unchanged"));
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn command_v_uses_event_modifiers_and_negotiated_paste_mode() {
+            let mut term = terminal();
+            term.feed(b"\x1b[?2004h");
+            term.backend.sync();
+            let view = TerminalView { term: &term };
+            let mut state = TerminalViewState::new(); // no ModifiersChanged
+            let mut clipboard = Clipboard(Some("echo 中文\n".into()));
+            let (command, handled) = view.handle_keyboard_event(
+                &mut state, &mut clipboard, &key("v", Modifiers::COMMAND),
+            );
+            assert!(handled);
+            assert!(matches!(command, Some(Command::Write(data))
+                if data == "\x1b[200~echo 中文\n\x1b[201~".as_bytes()));
+
+            // Releasing Command must take effect even if the cache is stale.
+            let (command, handled) = view.handle_keyboard_event(
+                &mut state, &mut clipboard, &key("v", Modifiers::empty()),
+            );
+            assert!(handled);
+            assert!(matches!(command, Some(Command::Write(data)) if data == b"v"));
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn copy_preserves_cjk_and_line_breaks_and_empty_copy_keeps_clipboard() {
+            let mut term = terminal();
+            term.feed("中文ABC\r\n第二行".as_bytes());
+            term.backend.handle(Command::SelectStart(SelectionType::Simple, (0.0, 0.0)));
+            term.backend.handle(Command::SelectUpdate((799.0, 20.0)));
+            let view = TerminalView { term: &term };
+            let mut state = TerminalViewState::new();
+            let mut clipboard = Clipboard(None);
+            let (command, handled) = view.handle_keyboard_event(
+                &mut state, &mut clipboard, &key("c", Modifiers::COMMAND),
+            );
+            assert!(handled);
+            assert!(command.is_none());
+            assert_eq!(clipboard.0.as_deref(), Some("中文ABC\n第二行"));
+
+            let empty = terminal();
+            let view = TerminalView { term: &empty };
+            let (_, handled) = view.handle_keyboard_event(
+                &mut state, &mut clipboard, &key("c", Modifiers::COMMAND),
+            );
+            assert!(handled);
+            assert_eq!(clipboard.0.as_deref(), Some("中文ABC\n第二行"));
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn empty_or_non_text_clipboard_is_consumed_without_writing_to_remote() {
+            let term = terminal();
+            let view = TerminalView { term: &term };
+            let mut state = TerminalViewState::new();
+            for contents in [None, Some(String::new())] {
+                let (command, handled) = view.handle_keyboard_event(
+                    &mut state, &mut Clipboard(contents), &key("v", Modifiers::COMMAND),
+                );
+                assert!(handled);
+                assert!(command.is_none());
+            }
+        }
+    }
 
     mod handle_left_button_pressed_tests {
         use super::*;
