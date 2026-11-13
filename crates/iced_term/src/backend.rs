@@ -12,7 +12,7 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{
     self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
 };
-use alacritty_terminal::{tty, Grid};
+use alacritty_terminal::{tty, vte, Grid};
 use iced::keyboard::Modifiers;
 use iced_core::Size;
 use std::borrow::Cow;
@@ -21,6 +21,46 @@ use std::io::Result;
 use std::ops::{Index, RangeInclusive};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// Outbound side of a terminal session: where keystrokes and terminal
+/// replies (cursor position reports, mouse reports, ...) are delivered.
+///
+/// Local sessions write into alacritty's PTY notifier. Remote sessions push
+/// the same bytes into an SSH channel, so the terminal core stays unaware of
+/// which transport it is attached to.
+pub trait Transport: Send + Sync {
+    fn write(&self, data: &[u8]);
+    fn resize(&self, cols: u16, rows: u16);
+}
+
+pub(crate) enum Sink {
+    Local(Notifier),
+    Remote(Arc<dyn Transport>),
+}
+
+impl Sink {
+    fn write(&self, data: &[u8]) {
+        match self {
+            Sink::Local(notifier) => notifier.notify(data.to_vec()),
+            Sink::Remote(transport) => transport.write(data),
+        }
+    }
+
+    fn resize(&mut self, size: WindowSize) {
+        match self {
+            Sink::Local(notifier) => notifier.on_resize(size),
+            Sink::Remote(transport) => {
+                transport.resize(size.num_cols, size.num_lines)
+            },
+        }
+    }
+
+    fn shutdown(&self) {
+        if let Sink::Local(notifier) = self {
+            let _ = notifier.0.send(Msg::Shutdown);
+        }
+    }
+}
 
 const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
 
@@ -134,7 +174,8 @@ impl From<TerminalSize> for WindowSize {
 pub struct Backend {
     term: Arc<FairMutex<Term<EventProxy>>>,
     size: TerminalSize,
-    notifier: Notifier,
+    sink: Sink,
+    parser: vte::ansi::Processor,
     last_content: RenderableContent,
     pub(crate) url_regex: RegexSearch,
 }
@@ -183,10 +224,56 @@ impl Backend {
         Ok(Self {
             term: term.clone(),
             size: terminal_size,
-            notifier,
+            sink: Sink::Local(notifier),
+            parser: vte::ansi::Processor::new(),
             last_content: initial_content,
             url_regex: RegexSearch::new(URL_REGEX).expect("invalid url regexp"),
         })
+    }
+
+    /// Builds a backend that owns no process of its own. Input and output are
+    /// pumped by the caller through [`Backend::feed`] and the given transport,
+    /// which is how SSH sessions attach to the terminal core.
+    pub fn new_remote(
+        id: u64,
+        pty_event_proxy_sender: mpsc::Sender<Event>,
+        transport: Arc<dyn Transport>,
+    ) -> Self {
+        let config = term::Config::default();
+        let terminal_size = TerminalSize::default();
+        let event_proxy = EventProxy(pty_event_proxy_sender);
+
+        let mut term = Term::new(config, &terminal_size, event_proxy);
+        let cursor = term.grid_mut().cursor_cell().clone();
+
+        let initial_content = RenderableContent {
+            grid: term.grid().clone(),
+            selectable_range: None,
+            terminal_mode: *term.mode(),
+            terminal_size,
+            cursor: cursor.clone(),
+            hovered_hyperlink: None,
+        };
+
+        let _ = id;
+
+        Self {
+            term: Arc::new(FairMutex::new(term)),
+            size: terminal_size,
+            sink: Sink::Remote(transport),
+            parser: vte::ansi::Processor::new(),
+            last_content: initial_content,
+            url_regex: RegexSearch::new(URL_REGEX).expect("invalid url regexp"),
+        }
+    }
+
+    /// Feeds raw bytes received from the remote side into the VT parser.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        // Clone the Arc so the parser (borrowed from self) and the terminal
+        // guard (borrowed from the Arc) do not conflict.
+        let term = self.term.clone();
+        let mut term = term.lock();
+        self.parser.advance(&mut *term, bytes);
     }
 
     pub fn handle(&mut self, cmd: Command) -> Action {
@@ -203,7 +290,7 @@ impl Backend {
                         action = Action::ChangeTitle(title);
                     },
                     Event::PtyWrite(pty) => {
-                        self.notifier.notify(pty.into_bytes())
+                        self.sink.write(&pty.into_bytes())
                     },
                     _ => {},
                 };
@@ -324,7 +411,7 @@ impl Backend {
             c
         );
 
-        self.notifier.notify(msg.as_bytes().to_vec());
+        self.sink.write(msg.as_bytes());
     }
 
     fn normal_mouse_report(&self, point: Point, button: u8, is_utf8: bool) {
@@ -356,7 +443,7 @@ impl Backend {
             msg.push(32 + 1 + line.0 as u8);
         }
 
-        self.notifier.notify(msg);
+        self.sink.write(&msg);
     }
 
     fn start_selection(
@@ -442,7 +529,7 @@ impl Backend {
         if lines > 0 && cols > 0 {
             self.size.num_lines = lines;
             self.size.num_cols = cols;
-            self.notifier.on_resize(self.size.into());
+            self.sink.resize(self.size.into());
             terminal.resize(TermSize::new(
                 self.size.num_cols as usize,
                 self.size.num_lines as usize,
@@ -451,7 +538,8 @@ impl Backend {
     }
 
     fn write<I: Into<Cow<'static, [u8]>>>(&self, input: I) {
-        self.notifier.notify(input);
+        let data: Cow<'static, [u8]> = input.into();
+        self.sink.write(data.as_ref());
     }
 
     fn scroll(&mut self, terminal: &mut Term<EventProxy>, delta_value: i32) {
@@ -470,7 +558,7 @@ impl Backend {
                     content.push(line_cmd);
                 }
 
-                self.notifier.notify(content);
+                self.sink.write(&content);
             } else {
                 terminal.grid_mut().scroll_display(scroll);
             }
@@ -571,7 +659,7 @@ impl Default for RenderableContent {
 
 impl Drop for Backend {
     fn drop(&mut self) {
-        let _ = self.notifier.0.send(Msg::Shutdown);
+        self.sink.shutdown();
     }
 }
 

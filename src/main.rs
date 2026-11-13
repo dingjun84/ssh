@@ -1,10 +1,19 @@
+mod ssh;
+
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, OnceLock};
+
 use iced::font::Font;
 use iced::widget::{button, column, container, row, text};
 use iced::{Color, Element, Length, Subscription, Task};
 use iced_term::settings::{
     BackendSettings, FontSettings, Settings as TermSettings, ThemeSettings,
 };
-use iced_term::{ColorPalette, Command as TermCommand, Terminal, TerminalView};
+use iced_term::{ColorPalette, Command as TermCommand, Terminal, TerminalView, Transport};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::Mutex;
+
+use ssh::{Auth, SshEvent, SshRequest};
 
 const BG: Color = Color::from_rgb(0.118, 0.122, 0.110);
 const SIDEBAR: Color = Color::from_rgb(0.133, 0.137, 0.122);
@@ -12,6 +21,18 @@ const BAR: Color = Color::from_rgb(0.098, 0.102, 0.090);
 const FG: Color = Color::from_rgb(0.973, 0.973, 0.949);
 const DIM: Color = Color::from_rgb(0.459, 0.443, 0.369);
 const ACCENT: Color = Color::from_rgb(0.651, 0.886, 0.180);
+const WARN: Color = Color::from_rgb(0.992, 0.592, 0.122);
+const DANGER: Color = Color::from_rgb(0.976, 0.149, 0.447);
+
+static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn runtime() -> tokio::runtime::Handle {
+    RUNTIME
+        .get()
+        .expect("tokio runtime must be initialised before use")
+        .handle()
+        .clone()
+}
 
 fn monokai() -> ColorPalette {
     ColorPalette {
@@ -46,10 +67,55 @@ fn monokai() -> ColorPalette {
     }
 }
 
+fn term_settings() -> TermSettings {
+    TermSettings {
+        font: FontSettings {
+            size: 13.0,
+            scale_factor: 1.3,
+            font_type: Font::with_name("Menlo"),
+        },
+        theme: ThemeSettings::new(Box::new(monokai())),
+        backend: BackendSettings::default(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Status {
+    Local,
+    Connecting,
+    Connected,
+    Closed,
+    Failed(String),
+}
+
+impl Status {
+    fn label(&self) -> &str {
+        match self {
+            Status::Local => "本地",
+            Status::Connecting => "连接中",
+            Status::Connected => "已连接",
+            Status::Closed => "已断开",
+            Status::Failed(_) => "失败",
+        }
+    }
+
+    fn color(&self) -> Color {
+        match self {
+            Status::Local | Status::Connected => ACCENT,
+            Status::Connecting => WARN,
+            Status::Closed => DIM,
+            Status::Failed(_) => DANGER,
+        }
+    }
+}
+
 struct Tab {
     id: u64,
     title: String,
     term: Terminal,
+    transport: Option<Arc<ssh::SshTransport>>,
+    events: Option<Arc<Mutex<UnboundedReceiver<SshEvent>>>>,
+    status: Status,
 }
 
 struct App {
@@ -61,25 +127,19 @@ struct App {
 #[derive(Debug, Clone)]
 enum Message {
     Term(iced_term::Event),
+    Ssh(u64, SshEvent),
     Open(&'static str),
     SelectTab(usize),
     CloseTab(usize),
 }
 
-fn spawn(id: u64, program: &str, args: Vec<String>) -> Terminal {
-    let settings = TermSettings {
-        font: FontSettings {
-            size: 13.0,
-            scale_factor: 1.3,
-            font_type: Font::with_name("Menlo"),
-        },
-        theme: ThemeSettings::new(Box::new(monokai())),
-        backend: BackendSettings {
-            program: program.to_string(),
-            args,
-            env: Default::default(),
-            working_directory: None,
-        },
+fn spawn_local(id: u64, program: &str, args: Vec<String>) -> Terminal {
+    let mut settings = term_settings();
+    settings.backend = BackendSettings {
+        program: program.to_string(),
+        args,
+        env: Default::default(),
+        working_directory: None,
     };
     Terminal::new(id, settings).expect("failed to create terminal")
 }
@@ -91,8 +151,27 @@ impl App {
             active: 0,
             next_id: 1,
         };
-        app.open_selftest();
+        // Unattended smoke test hook: lets CI (and me) open a real session
+        // without clicking through the UI.
+        if std::env::var("SSH_AUTOCONNECT").is_ok() {
+            app.open_demo_host();
+        } else {
+            app.open_local();
+        }
         (app, Task::none())
+    }
+
+    fn open_demo_host(&mut self) {
+        self.open_ssh(
+            "43.139.142.161",
+            "43.139.142.161",
+            22,
+            "root",
+            Auth::Key {
+                path: shellexpand("~/.ssh/id_rsa"),
+                passphrase: None,
+            },
+        );
     }
 
     fn open_local(&mut self) {
@@ -102,7 +181,10 @@ impl App {
         self.tabs.push(Tab {
             id,
             title: "local".into(),
-            term: spawn(id, &shell, vec![]),
+            term: spawn_local(id, &shell, vec![]),
+            transport: None,
+            events: None,
+            status: Status::Local,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -131,8 +213,6 @@ printf '\033[?1049h\033[2J\033[H\033[1;35m ALT-SCREEN 已进入：vim / htop 走
 sleep 2
 printf '\033[?1049l'
 printf '\033[1;32m✓ 已回到主屏幕，alt-screen 切换正常\033[0m\n'
-printf '\033[1;33m===== 7. 宽行折行 =====\033[0m\n'
-printf '0123456789%.0s' $(seq 1 12); printf '\n'
 printf '\033[1;32m=== 自检输出结束，保持 30 分钟供缩放测试 ===\033[0m\n'
 sleep 1800
 "#;
@@ -141,29 +221,43 @@ sleep 1800
         self.tabs.push(Tab {
             id,
             title: "渲染自检".into(),
-            term: spawn(
+            term: spawn_local(
                 id,
                 "/bin/zsh",
                 vec!["-f".to_string(), "-c".to_string(), script.to_string()],
             ),
+            transport: None,
+            events: None,
+            status: Status::Local,
         });
         self.active = self.tabs.len() - 1;
     }
 
-    fn open_ssh(&mut self, host: &str, port: u16) {
+    fn open_ssh(&mut self, label: &str, host: &str, port: u16, user: &str, auth: Auth) {
         let id = self.next_id;
         self.next_id += 1;
-        let args = vec![
-            "-o".to_string(),
-            "StrictHostKeyChecking=accept-new".to_string(),
-            "-p".to_string(),
-            port.to_string(),
-            host.to_string(),
-        ];
+
+        let (transport, rx) = ssh::spawn(
+            &runtime(),
+            SshRequest {
+                host: host.to_string(),
+                port,
+                user: user.to_string(),
+                auth,
+                cols: 100,
+                rows: 30,
+            },
+        );
+
+        let term = Terminal::new_remote(id, term_settings(), transport.clone());
+
         self.tabs.push(Tab {
             id,
-            title: host.to_string(),
-            term: spawn(id, "/usr/bin/ssh", args),
+            title: label.to_string(),
+            term,
+            transport: Some(transport),
+            events: Some(Arc::new(Mutex::new(rx))),
+            status: Status::Connecting,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -175,19 +269,47 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
             if let Some(tab) = state.tabs.iter_mut().find(|t| t.id == id) {
                 tab.term.handle(TermCommand::ProxyToBackend(cmd));
             }
-        }
+        },
+        Message::Ssh(id, event) => {
+            if let Some(tab) = state.tabs.iter_mut().find(|t| t.id == id) {
+                match event {
+                    SshEvent::Data(bytes) => tab.term.feed(&bytes),
+                    SshEvent::Connected => {
+                        tab.status = Status::Connected;
+                        // Unattended smoke test: SSH_PROBE feeds a command to the
+                        // remote shell right after login so the whole chain can be
+                        // verified without a keyboard.
+                        if let Ok(probe) = std::env::var("SSH_PROBE")
+                            && let Some(t) = &tab.transport
+                        {
+                            t.write(probe.as_bytes());
+                        }
+                    },
+                    SshEvent::Error(err) => {
+                        tab.status = Status::Failed(err.clone());
+                        let message =
+                            format!("\r\n\x1b[1;31m[连接错误] {err}\x1b[0m\r\n");
+                        tab.term.feed(message.as_bytes());
+                    },
+                    SshEvent::Closed => {
+                        if !matches!(tab.status, Status::Failed(_)) {
+                            tab.status = Status::Closed;
+                        }
+                    },
+                }
+            }
+        },
         Message::Open(target) => match target {
             "local" => state.open_local(),
             "selftest" => state.open_selftest(),
-            "vm128" => state.open_ssh("casperding@192.168.189.128", 22),
-            "dev01" => state.open_ssh("dev01.xtrigg.com", 22),
-            _ => {}
+            "demo" => state.open_demo_host(),
+            _ => {},
         },
         Message::SelectTab(index) => {
             if index < state.tabs.len() {
                 state.active = index;
             }
-        }
+        },
         Message::CloseTab(index) => {
             if index < state.tabs.len() {
                 state.tabs.remove(index);
@@ -195,18 +317,76 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
                     state.active = state.tabs.len() - 1;
                 }
             }
-        }
+        },
     }
     Task::none()
 }
 
+fn shellexpand(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return format!("{}/{}", home.to_string_lossy(), rest);
+    }
+    path.to_string()
+}
+
+#[derive(Clone)]
+struct SshStream {
+    id: u64,
+    rx: Arc<Mutex<UnboundedReceiver<SshEvent>>>,
+}
+
+impl Hash for SshStream {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+fn ssh_stream(s: &SshStream) -> iced::futures::stream::BoxStream<'static, (u64, SshEvent)> {
+    use iced::futures::StreamExt;
+
+    let id = s.id;
+    let rx = s.rx.clone();
+    iced::stream::channel(128, async move |mut out| {
+        use iced::futures::SinkExt;
+
+        loop {
+            let mut guard = rx.lock().await;
+            match guard.recv().await {
+                Some(event) => {
+                    if out.send((id, event)).await.is_err() {
+                        break;
+                    }
+                },
+                None => break,
+            }
+        }
+    })
+    .boxed()
+}
+
 fn subscription(state: &App) -> Subscription<Message> {
-    Subscription::batch(
-        state
-            .tabs
-            .iter()
-            .map(|tab| tab.term.subscription().map(Message::Term)),
-    )
+    let mut subs: Vec<Subscription<Message>> = Vec::new();
+
+    for tab in &state.tabs {
+        subs.push(tab.term.subscription().map(Message::Term));
+
+        if let Some(rx) = &tab.events {
+            subs.push(
+                Subscription::run_with(
+                    SshStream {
+                        id: tab.id,
+                        rx: rx.clone(),
+                    },
+                    ssh_stream,
+                )
+                .map(|(id, event)| Message::Ssh(id, event)),
+            );
+        }
+    }
+
+    Subscription::batch(subs)
 }
 
 fn sidebar(state: &App) -> Element<'_, Message> {
@@ -219,31 +399,26 @@ fn sidebar(state: &App) -> Element<'_, Message> {
             .style(flat_button),
     );
     col = col.push(
-        button(text("渲染自检").size(12).color(ACCENT))
+        button(text("渲染自检").size(12).color(DIM))
             .on_press(Message::Open("selftest"))
             .width(Length::Fill)
             .style(flat_button),
     );
     col = col.push(container(text("")).height(Length::Fixed(8.0)));
 
-    col = col.push(text("生产环境 · 2").size(11).color(DIM));
-    for (label, key, detail) in [
-        ("192.168.189.128", "vm128", "casperding"),
-        ("dev01.xtrigg.com", "dev01", "cloudflared"),
-    ] {
-        col = col.push(
-            button(
-                column![
-                    text(label).size(12).color(FG),
-                    text(detail).size(10).color(DIM),
-                ]
-                .spacing(1),
-            )
-            .on_press(Message::Open(key))
-            .width(Length::Fill)
-            .style(flat_button),
-        );
-    }
+    col = col.push(text("生产环境 · 1").size(11).color(DIM));
+    col = col.push(
+        button(
+            column![
+                text("43.139.142.161").size(12).color(FG),
+                text("root · 私钥").size(10).color(DIM),
+            ]
+            .spacing(1),
+        )
+        .on_press(Message::Open("demo"))
+        .width(Length::Fill)
+        .style(flat_button),
+    );
 
     col = col.push(container(text("")).height(Length::Fixed(12.0)));
     col = col.push(
@@ -267,6 +442,7 @@ fn tabbar(state: &App) -> Element<'_, Message> {
     for (index, tab) in state.tabs.iter().enumerate() {
         let is_active = index == state.active;
         let label = row![
+            text("●").size(8).color(tab.status.color()),
             text(tab.title.clone())
                 .size(11)
                 .color(if is_active { FG } else { DIM }),
@@ -309,12 +485,21 @@ fn view(state: &App) -> Element<'_, Message> {
 
     let main = column![tabbar(state), terminal].height(Length::Fill);
 
+    let active_status = state.tabs.get(state.active).map(|t| &t.status);
+    let status_text = match active_status {
+        Some(Status::Failed(err)) => err.clone(),
+        Some(status) => status.label().to_string(),
+        None => "—".to_string(),
+    };
+
     let status = container(
         row![
-            text("● 本地验证模式").size(10).color(ACCENT),
-            text("终端内核 alacritty_terminal 0.25 / 渲染 iced canvas")
-                .size(10)
-                .color(DIM),
+            text("●")
+                .size(9)
+                .color(active_status.map(Status::color).unwrap_or(DIM)),
+            text(status_text).size(10).color(FG),
+            text("keepalive 30s / max 4").size(10).color(DIM),
+            text("alacritty 0.25 · iced 0.14").size(10).color(DIM),
         ]
         .spacing(12),
     )
@@ -343,7 +528,7 @@ fn flat_button(_theme: &iced::Theme, status: button::Status) -> button::Style {
     let bg = match status {
         button::Status::Hovered | button::Status::Pressed => {
             Some(Color::from_rgba(1.0, 1.0, 1.0, 0.07))
-        }
+        },
         _ => None,
     };
     button::Style {
@@ -389,6 +574,12 @@ fn app_theme(_state: &App) -> iced::Theme {
 }
 
 fn main() -> iced::Result {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    let _ = RUNTIME.set(rt);
+
     iced::application(App::boot, update, view)
         .title("SSH 工作台")
         .subscription(subscription)

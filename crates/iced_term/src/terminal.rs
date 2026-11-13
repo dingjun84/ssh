@@ -65,6 +65,43 @@ impl Terminal {
         &self.widget_id
     }
 
+    /// Creates a terminal whose bytes are pumped in by the caller instead of
+    /// a local PTY. Used for SSH sessions: the transport owns the outbound
+    /// channel, and [`Terminal::feed`] delivers whatever the remote sends.
+    pub fn new_remote(
+        id: u64,
+        settings: Settings,
+        transport: std::sync::Arc<dyn backend::Transport>,
+    ) -> Self {
+        let (backend_event_tx, backend_event_rx) = mpsc::channel(100);
+        let theme = Theme::new(settings.theme);
+        let font = TermFont::new(settings.font);
+
+        let mut terminal = Self {
+            id,
+            widget_id: iced::widget::Id::unique(),
+            font,
+            theme,
+            cache: Cache::default(),
+            bindings: BindingsLayout::default(),
+            backend: backend::Backend::new_remote(
+                id,
+                backend_event_tx,
+                transport,
+            ),
+            backend_event_rx: Arc::new(Mutex::new(backend_event_rx)),
+        };
+
+        terminal.sync_font();
+        terminal
+    }
+
+    /// Pushes bytes received from the remote host through the VT parser.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.backend.feed(bytes);
+        self.redraw();
+    }
+
     pub fn subscription(&self) -> Subscription<Event> {
         let data = TerminalSubscriptionData {
             id: self.id,
