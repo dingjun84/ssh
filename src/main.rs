@@ -1612,7 +1612,7 @@ fn sftp_panel(state: &App) -> Element<'_, Message> {
 
     let status = container(
         text(if ui.status.is_empty() {
-            "双击目录进入，点文件下载到 ~/Downloads".to_string()
+            "点目录进入，点文件下载 · 拖文件进来上传".to_string()
         } else {
             ui.status.clone()
         })
