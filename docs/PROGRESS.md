@@ -3,6 +3,25 @@
 > 写给下一个 session。读完这份就能接着干，不用重新摸一遍坑。
 > 最后更新：2026-11-13
 
+## 本轮接续 2：SFTP 面板（2026-11-13）
+
+- 复用现有 SSH 会话：`ssh::run` 认证后把 `Arc<client::Handle>` 放进 `SessionSlot`，`sftp.rs` 拿它开第二个 channel，`request_subsystem(true, "sftp")` + `SftpSession::new(channel.into_stream())`。没有第二份认证、没有第二条 TCP。
+- 面板：标签栏 `SFTP` 开关 → 右侧 290px。列目录（目录优先、大小右对齐）、点目录进入、`↑` 返回、`⟳` 刷新、点文件下载到 `~/Downloads`（重名自动 ` (1)`）、把文件拖进窗口上传到当前目录。
+- 重连：`russh::client::Handle` **不是 `Clone`**，共享靠 `Arc`；worker 每条命令都核对 `SessionSlot` 的 generation，对不上就重建 SFTP 会话。`main.rs` 在重连时直接重建 worker（`attach_sftp`）并让 `sftp_generation` 递增，否则 iced 订阅按 hash 复用死通道。
+- 传输：64 KiB 分块，进度事件 150 ms 节流；`Done` 之后自动重列目录。
+- 依赖：`russh-sftp` 3.0.1。它把 russh 只列为 dev-dependency，因此不会锁死 russh 0.65。之前那次 `rsproxy.cn` DNS 失败是瞬时的，本次索引可用。
+- **未真机验证**：沙箱无外网（`Network is unreachable`）。`SSH_SFTP_PROBE=1 SSH_AUTOCONNECT=1` 可让面板在连上后自动打开并列家目录。
+- 顺带修测试竞态：`store` / `hostkey` 的临时目录从时间戳改为「pid + 原子计数器」。macOS 时钟精度不足以区分并发测试，撞名后互相删库，`update_moves_group_and_switches_auth` 会偶发失败。
+
+## 本轮接续：剪贴板回归修复（2026-11-13）
+
+- ⌘C/⌘V 使用按键事件自带的修饰键，避免焦点切换后缓存过期；Ctrl+C 保持发送 `0x03`，未绑定的 Command 组合不输入字符。
+- 复制调用 alacritty 的选区文本接口，修复多行没有换行、中文宽字符占位空格混入的问题；空选区不覆盖剪贴板。
+- 粘贴支持括号粘贴模式，内容中的 ESC 被移除；普通模式 LF/CRLF 转 CR。空剪贴板也消费快捷键，不向远端发送字节。
+- 新增 Cargo workspace 和 6 项针对真实键盘处理器/VT 选区的回归测试；`cargo test --workspace --offline` 共 37 项通过，`cargo build --offline` 通过。
+- 真机快捷键验证仍待完成：桌面工具拒绝访问 Terminal 应用，未标记 P0 完成。操作清单见 `docs/HANDOFF.md` 文首。
+- SFTP 官方接入方式已核对，需复用当前 SSH session 开 subsystem；依赖下载因 `rsproxy.cn` DNS 失败受阻，已撤回依赖改动，尚未实现文件面板。
+
 ## 一句话现状
 
 **真实 SSH 链路已经跑通**：能连 `root@43.139.142.161`，登录、执行命令、中文/颜色/alt-screen 渲染、窗口尺寸同步全部验证过。

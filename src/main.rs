@@ -1,13 +1,15 @@
 mod hostkey;
 mod secrets;
+mod sftp;
 mod ssh;
 mod store;
 
 use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use iced::font::Font;
-use iced::widget::{button, column, container, row, text};
+use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Color, Element, Length, Subscription, Task};
 use iced_term::settings::{
     BackendSettings, FontSettings, Settings as TermSettings, ThemeSettings,
@@ -136,6 +138,24 @@ struct Tab {
     /// without this the widget would keep listening on the *old*, closed event
     /// channel and never see anything again.
     generation: u64,
+    sftp: Option<sftp::Handle>,
+    sftp_events: Option<Arc<Mutex<UnboundedReceiver<sftp::SftpEvent>>>>,
+    /// Bumped whenever the SFTP worker is rebuilt, for the same hash reason as
+    /// `generation`.
+    sftp_generation: u64,
+    sftp_ui: SftpUi,
+}
+
+/// Everything the SFTP side panel needs to render itself.
+#[derive(Default)]
+struct SftpUi {
+    open: bool,
+    /// Empty until the first listing resolves the real path.
+    path: String,
+    entries: Vec<sftp::Entry>,
+    status: String,
+    /// A transfer or listing is in flight.
+    busy: bool,
 }
 
 /// Backoff schedule: 1, 2, 4, 8, 16, then a 30s ceiling.
@@ -312,6 +332,18 @@ enum Message {
     Reconnect(u64),
     /// User pressed the status-bar retry button.
     Retry,
+    /// SFTP worker event for a tab.
+    Sftp(u64, sftp::SftpEvent),
+    /// Show/hide the file panel.
+    SftpToggle,
+    SftpRefresh,
+    SftpUp,
+    /// Descend into a directory (name relative to the current path).
+    SftpOpenDir(String),
+    /// Download a remote file to ~/Downloads.
+    SftpDownload(String),
+    /// A file was dropped on the window; upload it to the panel's directory.
+    FileDropped(PathBuf),
 }
 
 fn spawn_local(id: u64, program: &str, args: Vec<String>) -> Terminal {
@@ -323,6 +355,18 @@ fn spawn_local(id: u64, program: &str, args: Vec<String>) -> Terminal {
         working_directory: None,
     };
     Terminal::new(id, settings).expect("failed to create terminal")
+}
+
+/// Rebuilds the SFTP worker for a tab. Called on first connect and on every
+/// reconnect: the worker caches an `sftp` subsystem channel, and that channel
+/// dies together with the SSH connection it was opened on.
+fn attach_sftp(tab: &mut Tab, slot: Arc<ssh::SessionSlot>) {
+    let (handle, rx) = sftp::spawn(&runtime(), slot);
+    tab.sftp = Some(handle);
+    tab.sftp_events = Some(Arc::new(Mutex::new(rx)));
+    // New receiver, so the subscription hash must change or iced keeps reading
+    // the old channel (same trap as `Tab::generation`).
+    tab.sftp_generation += 1;
 }
 
 /// Seed data for a fresh install: the box this project is developed against.
@@ -434,6 +478,10 @@ impl App {
             fingerprint_note: None,
             connect_attempts: 0,
             generation: 0,
+            sftp: None,
+            sftp_events: None,
+            sftp_generation: 0,
+            sftp_ui: SftpUi::default(),
         });
         self.active = self.tabs.len() - 1;
     }
@@ -483,6 +531,10 @@ sleep 1800
             fingerprint_note: None,
             connect_attempts: 0,
             generation: 0,
+            sftp: None,
+            sftp_events: None,
+            sftp_generation: 0,
+            sftp_ui: SftpUi::default(),
         });
         self.active = self.tabs.len() - 1;
     }
@@ -506,14 +558,14 @@ sleep 1800
         let id = self.next_id;
         self.next_id += 1;
 
-        let (transport, rx) = match self.connect_session(&session) {
+        let (transport, rx, slot) = match self.connect_session(&session) {
             Ok(connected) => connected,
             Err(err) => return self.open_failed(&session, err),
         };
 
         let term = Terminal::new_remote(id, term_settings(), transport.clone());
 
-        self.tabs.push(Tab {
+        let mut tab = Tab {
             id,
             session_id: Some(session.id),
             title: session.label.clone(),
@@ -525,7 +577,15 @@ sleep 1800
             fingerprint_note: None,
             connect_attempts: 0,
             generation: 0,
-        });
+            sftp: None,
+            sftp_events: None,
+            sftp_generation: 0,
+            sftp_ui: SftpUi::default(),
+        };
+        // SFTP rides on the same session; give it the handle as soon as the
+        // handshake publishes one.
+        attach_sftp(&mut tab, slot);
+        self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         let _ = self.store.touch(session.id);
     }
@@ -535,7 +595,14 @@ sleep 1800
     fn connect_session(
         &self,
         session: &Session,
-    ) -> Result<(Arc<ssh::SshTransport>, UnboundedReceiver<SshEvent>), String> {
+    ) -> Result<
+        (
+            Arc<ssh::SshTransport>,
+            UnboundedReceiver<SshEvent>,
+            Arc<ssh::SessionSlot>,
+        ),
+        String,
+    > {
         let auth = match &session.auth {
             AuthKind::Key { path } => Auth::Key {
                 path: shellexpand(path),
@@ -579,6 +646,10 @@ sleep 1800
             fingerprint_note: None,
             connect_attempts: 0,
             generation: 0,
+            sftp: None,
+            sftp_events: None,
+            sftp_generation: 0,
+            sftp_ui: SftpUi::default(),
         });
         self.active = self.tabs.len() - 1;
     }
@@ -610,7 +681,7 @@ sleep 1800
         };
 
         match self.connect_session(&session) {
-            Ok((transport, rx)) => {
+            Ok((transport, rx, slot)) => {
                 let tab = &mut self.tabs[index];
                 // Keep the terminal (and its scrollback); only the pipe
                 // underneath changes.
@@ -623,6 +694,9 @@ sleep 1800
                 tab.status = Status::Connecting;
                 tab.fingerprint = None;
                 tab.fingerprint_note = None;
+                // The old SFTP channel died with the connection; rebuild the
+                // worker around the freshly published session.
+                attach_sftp(tab, slot);
                 let _ = self.store.touch(session.id);
                 Task::none()
             },
@@ -693,6 +767,18 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
                         // A successful handshake resets the backoff so the next
                         // drop starts at 1s again.
                         tab.connect_attempts = 0;
+                        // Smoke-test hook: open the panel and list the login
+                        // directory so SFTP can be checked without the mouse.
+                        if std::env::var_os("SSH_SFTP_PROBE").is_some()
+                            && tab.sftp.is_some()
+                        {
+                            tab.sftp_ui.open = true;
+                            tab.sftp_ui.busy = true;
+                            tab.sftp_ui.status = "加载中…".into();
+                            if let Some(handle) = &tab.sftp {
+                                handle.send(sftp::Command::List(".".into()));
+                            }
+                        }
                     },
                     SshEvent::Error(err) => {
                         tab.status = Status::Failed(err.clone());
@@ -720,6 +806,111 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
                     state.tabs[index].connect_attempts = 0;
                 }
                 return state.reconnect(id);
+            }
+        },
+        Message::Sftp(id, event) => {
+            if let Some(index) = state.tab_index_for(id) {
+                let tab = &mut state.tabs[index];
+                match event {
+                    sftp::SftpEvent::Listing { path, entries } => {
+                        tab.sftp_ui.busy = false;
+                        tab.sftp_ui.path = path;
+                        tab.sftp_ui.status = format!("{} 项", entries.len());
+                        tab.sftp_ui.entries = entries;
+                    },
+                    sftp::SftpEvent::Progress { label, done, total } => {
+                        tab.sftp_ui.status = if total == 0 {
+                            format!("{label} · {}", sftp::human_size(done))
+                        } else {
+                            format!(
+                                "{label} {:.0}% · {} / {}",
+                                done as f64 * 100.0 / total as f64,
+                                sftp::human_size(done),
+                                sftp::human_size(total)
+                            )
+                        };
+                    },
+                    sftp::SftpEvent::Done(message) => {
+                        tab.sftp_ui.busy = false;
+                        tab.sftp_ui.status = message;
+                        // Uploads change the listing, so re-read what is on
+                        // screen instead of showing a stale directory.
+                        if !tab.sftp_ui.path.is_empty()
+                            && let Some(handle) = &tab.sftp
+                        {
+                            handle.send(sftp::Command::List(tab.sftp_ui.path.clone()));
+                        }
+                    },
+                    sftp::SftpEvent::Error(err) => {
+                        tab.sftp_ui.busy = false;
+                        tab.sftp_ui.status = err;
+                    },
+                }
+            }
+        },
+        Message::SftpToggle => {
+            if let Some(tab) = state.tabs.get_mut(state.active) {
+                tab.sftp_ui.open = !tab.sftp_ui.open;
+                if tab.sftp_ui.open && tab.sftp_ui.path.is_empty() {
+                    tab.sftp_ui.busy = true;
+                    tab.sftp_ui.status = "加载中…".into();
+                    if let Some(handle) = &tab.sftp {
+                        handle.send(sftp::Command::List(".".into()));
+                    }
+                }
+            }
+        },
+        Message::SftpRefresh => {
+            if let Some(tab) = state.tabs.get_mut(state.active) {
+                let path = current_sftp_path(tab);
+                tab.sftp_ui.busy = true;
+                if let Some(handle) = &tab.sftp {
+                    handle.send(sftp::Command::List(path));
+                }
+            }
+        },
+        Message::SftpUp => {
+            if let Some(tab) = state.tabs.get_mut(state.active) {
+                let parent = sftp::parent_remote(&current_sftp_path(tab));
+                tab.sftp_ui.busy = true;
+                if let Some(handle) = &tab.sftp {
+                    handle.send(sftp::Command::List(parent));
+                }
+            }
+        },
+        Message::SftpOpenDir(name) => {
+            if let Some(tab) = state.tabs.get_mut(state.active) {
+                let target = sftp::join_remote(&current_sftp_path(tab), &name);
+                tab.sftp_ui.busy = true;
+                if let Some(handle) = &tab.sftp {
+                    handle.send(sftp::Command::List(target));
+                }
+            }
+        },
+        Message::SftpDownload(remote) => {
+            if let Some(tab) = state.tabs.get_mut(state.active) {
+                let local = unique_download_path(&remote);
+                tab.sftp_ui.busy = true;
+                tab.sftp_ui.status = format!("下载 {}", sftp::basename(&remote));
+                if let Some(handle) = &tab.sftp {
+                    handle.send(sftp::Command::Download { remote, local });
+                }
+            }
+        },
+        Message::FileDropped(path) => {
+            if let Some(tab) = state.tabs.get_mut(state.active) {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if tab.sftp_ui.open && !name.is_empty() {
+                    let remote = sftp::join_remote(&current_sftp_path(tab), &name);
+                    tab.sftp_ui.busy = true;
+                    tab.sftp_ui.status = format!("上传 {name}");
+                    if let Some(handle) = &tab.sftp {
+                        handle.send(sftp::Command::Upload { local: path, remote });
+                    }
+                }
             }
         },
         Message::OpenUtility(target) => match target {
@@ -852,6 +1043,49 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
 
 /// Expands a leading `~/`, since our key paths come from the database rather
 /// than from a shell.
+/// Remote directory the panel is showing; `.` stands in until the first
+/// listing resolves an absolute path.
+fn current_sftp_path(tab: &Tab) -> String {
+    if tab.sftp_ui.path.is_empty() {
+        ".".to_string()
+    } else {
+        tab.sftp_ui.path.clone()
+    }
+}
+
+fn downloads_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Downloads"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Never overwrite an existing download: `file.txt` becomes `file (1).txt`.
+fn unique_download_path(remote: &str) -> PathBuf {
+    let dir = downloads_dir();
+    let name = sftp::basename(remote);
+    let direct = dir.join(&name);
+    if !direct.exists() {
+        return direct;
+    }
+
+    let stem = Path::new(&name)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.clone());
+    let extension = Path::new(&name)
+        .extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy()))
+        .unwrap_or_default();
+
+    for copy in 1..1000 {
+        let candidate = dir.join(format!("{stem} ({copy}){extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    direct
+}
+
 fn shellexpand(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/")
         && let Some(home) = std::env::var_os("HOME")
@@ -900,6 +1134,44 @@ fn ssh_stream(s: &SshStream) -> iced::futures::stream::BoxStream<'static, (u64, 
     .boxed()
 }
 
+#[derive(Clone)]
+struct SftpStream {
+    id: u64,
+    /// Changes when the worker is rebuilt on reconnect.
+    generation: u64,
+    rx: Arc<Mutex<UnboundedReceiver<sftp::SftpEvent>>>,
+}
+
+impl Hash for SftpStream {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.generation.hash(state);
+    }
+}
+
+fn sftp_stream(s: &SftpStream) -> iced::futures::stream::BoxStream<'static, (u64, sftp::SftpEvent)> {
+    use iced::futures::StreamExt;
+
+    let id = s.id;
+    let rx = s.rx.clone();
+    iced::stream::channel(64, async move |mut out| {
+        use iced::futures::SinkExt;
+
+        loop {
+            let mut guard = rx.lock().await;
+            match guard.recv().await {
+                Some(event) => {
+                    if out.send((id, event)).await.is_err() {
+                        break;
+                    }
+                },
+                None => break,
+            }
+        }
+    })
+    .boxed()
+}
+
 fn subscription(state: &App) -> Subscription<Message> {
     let mut subs: Vec<Subscription<Message>> = Vec::new();
 
@@ -919,7 +1191,27 @@ fn subscription(state: &App) -> Subscription<Message> {
                 .map(|(id, event)| Message::Ssh(id, event)),
             );
         }
+
+        if let Some(rx) = &tab.sftp_events {
+            subs.push(
+                Subscription::run_with(
+                    SftpStream {
+                        id: tab.id,
+                        generation: tab.sftp_generation,
+                        rx: rx.clone(),
+                    },
+                    sftp_stream,
+                )
+                .map(|(id, event)| Message::Sftp(id, event)),
+            );
+        }
     }
+
+    // Drag-and-drop upload: the only window event the app cares about.
+    subs.push(iced::window::events().filter_map(|(_, event)| match event {
+        iced::window::Event::FileDropped(path) => Some(Message::FileDropped(path)),
+        _ => None,
+    }));
 
     Subscription::batch(subs)
 }
@@ -1239,6 +1531,116 @@ fn toggle_style(_theme: &iced::Theme, _status: button::Status, on: bool) -> butt
     }
 }
 
+/// Right-hand file browser. Reads only from `Tab::sftp_ui`; every interaction
+/// is a message, so the widget never touches the worker directly.
+fn sftp_panel(state: &App) -> Element<'_, Message> {
+    let Some(tab) = state.tabs.get(state.active) else {
+        return container(text("")).into();
+    };
+    let ui = &tab.sftp_ui;
+    let dir = current_sftp_path(tab);
+
+    let header = row![
+        button(text("↑").size(11).color(DIM))
+            .on_press(Message::SftpUp)
+            .padding([1, 6])
+            .style(flat_button),
+        button(text("⟳").size(11).color(DIM))
+            .on_press(Message::SftpRefresh)
+            .padding([1, 6])
+            .style(flat_button),
+        text(if ui.path.is_empty() { "…" } else { ui.path.as_str() })
+            .size(10)
+            .color(FG)
+            .width(Length::Fill),
+        button(text("×").size(11).color(DIM))
+            .on_press(Message::SftpToggle)
+            .padding([1, 6])
+            .style(ghost_button),
+    ]
+    .spacing(4)
+    .align_y(iced::Alignment::Center)
+    .padding([4, 6]);
+
+    let mut list = column![].spacing(1);
+    for entry in &ui.entries {
+        let marker = if entry.is_dir {
+            "▸"
+        } else if entry.is_symlink {
+            "↗"
+        } else {
+            " "
+        };
+        let label = row![
+            text(format!("{marker} {}", entry.name))
+                .size(11)
+                .color(if entry.is_dir { ACCENT } else { FG })
+                .width(Length::Fill),
+            text(if entry.is_dir {
+                String::new()
+            } else {
+                sftp::human_size(entry.size)
+            })
+            .size(9)
+            .color(DIM),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        let message = if entry.is_dir {
+            Message::SftpOpenDir(entry.name.clone())
+        } else {
+            Message::SftpDownload(sftp::join_remote(&dir, &entry.name))
+        };
+
+        list = list.push(
+            button(label)
+                .on_press(message)
+                .padding([2, 6])
+                .width(Length::Fill)
+                .style(flat_button),
+        );
+    }
+
+    if ui.entries.is_empty() && !ui.busy {
+        list = list.push(
+            container(text("空目录").size(10).color(DIM))
+                .padding([4, 6])
+                .width(Length::Fill),
+        );
+    }
+
+    let status = container(
+        text(if ui.status.is_empty() {
+            "双击目录进入，点文件下载到 ~/Downloads".to_string()
+        } else {
+            ui.status.clone()
+        })
+        .size(9)
+        .color(if ui.busy { WARN } else { DIM }),
+    )
+    .width(Length::Fill)
+    .padding([4, 6]);
+
+    container(column![
+        header,
+        scrollable(list).height(Length::Fill),
+        status
+    ])
+    .width(Length::Fixed(290.0))
+    .height(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(SIDEBAR.into()),
+        border: iced::border::Border {
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.06),
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
 fn tabbar(state: &App) -> Element<'_, Message> {
     let mut bar = row![].spacing(1).padding([0, 4]);
     for (index, tab) in state.tabs.iter().enumerate() {
@@ -1263,6 +1665,30 @@ fn tabbar(state: &App) -> Element<'_, Message> {
                 .style(move |theme, status| tab_style(theme, status, is_active)),
         );
     }
+    // Only remote tabs can host a file panel; local shells have no session.
+    if state
+        .tabs
+        .get(state.active)
+        .map(|tab| tab.session_id.is_some())
+        .unwrap_or(false)
+    {
+        let open = state
+            .tabs
+            .get(state.active)
+            .map(|tab| tab.sftp_ui.open)
+            .unwrap_or(false);
+        bar = bar.push(
+            button(
+                text("SFTP")
+                    .size(10)
+                    .color(if open { ACCENT } else { DIM }),
+            )
+            .on_press(Message::SftpToggle)
+            .padding([4, 10])
+            .style(ghost_button),
+        );
+    }
+
     container(bar)
         .width(Length::Fill)
         .height(Length::Fixed(30.0))
@@ -1285,7 +1711,17 @@ fn view(state: &App) -> Element<'_, Message> {
             .into()
     };
 
-    let main = column![tabbar(state), terminal].height(Length::Fill);
+    let mut workspace = row![terminal].height(Length::Fill);
+    if state
+        .tabs
+        .get(state.active)
+        .map(|tab| tab.sftp_ui.open)
+        .unwrap_or(false)
+    {
+        workspace = workspace.push(sftp_panel(state));
+    }
+
+    let main = column![tabbar(state), workspace].height(Length::Fill);
 
     let mut body = row![sidebar(state), main].height(Length::Fill);
     if state.draft.is_some() {

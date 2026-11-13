@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -65,7 +66,7 @@ pub struct SshRequest {
     pub rows: u16,
 }
 
-struct Handler {
+pub(crate) struct Handler {
     host: String,
     port: u16,
     /// Filled in by `check_server_key` so the caller can surface the
@@ -89,31 +90,82 @@ impl client::Handler for Handler {
     }
 }
 
+/// A place to park the live session handle so other subsystems (SFTP) can open
+/// their own channel on the *same* connection instead of dialing a second one.
+///
+/// `russh`'s `Handle` is not `Clone`, so it is shared behind an `Arc`. The
+/// slot must only be borrowed for the duration of one operation — holding it
+/// would keep a dead connection alive after the shell loop exits.
+pub(crate) struct SessionSlot {
+    inner: StdMutex<Option<(u64, Arc<client::Handle<Handler>>)>>,
+    counter: AtomicU64,
+}
+
+impl SessionSlot {
+    fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            inner: StdMutex::new(None),
+            counter: AtomicU64::new(0),
+        })
+    }
+
+    /// Every successful handshake gets a new generation so consumers can tell
+    /// a live channel from one that belonged to a previous connection.
+    fn next_generation(&self) -> u64 {
+        self.counter.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn publish(&self, generation: u64, handle: Arc<client::Handle<Handler>>) {
+        *self.inner.lock().unwrap() = Some((generation, handle));
+    }
+
+    /// Clears the slot only if it still belongs to `generation`; a reconnect
+    /// may already have installed a newer handle by the time the old loop ends.
+    fn retire(&self, generation: u64) {
+        let mut slot = self.inner.lock().unwrap();
+        if matches!(slot.as_ref(), Some((current, _)) if *current == generation) {
+            *slot = None;
+        }
+    }
+
+    pub(crate) fn current(&self) -> Option<(u64, Arc<client::Handle<Handler>>)> {
+        self.inner.lock().unwrap().clone()
+    }
+}
+
 /// Starts a connection attempt in the background and returns the transport
-/// handle plus the event stream to feed into the UI.
+/// handle, the event stream to feed into the UI, and the session slot that
+/// later lets SFTP attach to the finished connection.
 pub fn spawn(
     handle: &tokio::runtime::Handle,
     req: SshRequest,
-) -> (Arc<SshTransport>, UnboundedReceiver<SshEvent>) {
+) -> (
+    Arc<SshTransport>,
+    UnboundedReceiver<SshEvent>,
+    Arc<SessionSlot>,
+) {
     let (out_tx, out_rx) = unbounded_channel();
     let (evt_tx, evt_rx) = unbounded_channel();
     let transport = Arc::new(SshTransport { tx: out_tx });
+    let slot = SessionSlot::empty();
 
+    let worker_slot = slot.clone();
     handle.spawn(async move {
-        let result = run(req, out_rx, evt_tx.clone()).await;
+        let result = run(req, out_rx, evt_tx.clone(), worker_slot).await;
         if let Err(err) = result {
             let _ = evt_tx.send(SshEvent::Error(err));
         }
         let _ = evt_tx.send(SshEvent::Closed);
     });
 
-    (transport, evt_rx)
+    (transport, evt_rx, slot)
 }
 
 async fn run(
     req: SshRequest,
     mut out_rx: UnboundedReceiver<Outbound>,
     evt: UnboundedSender<SshEvent>,
+    slot: Arc<SessionSlot>,
 ) -> Result<(), String> {
     let config = Arc::new(client::Config {
         // Matches `ServerAliveInterval 30`: probe only after 30s of silence,
@@ -184,6 +236,13 @@ async fn run(
             }
         },
     }
+
+    // Authentication is done, so the handle can now be shared: subsystems
+    // (SFTP) open their own channel on this same connection rather than
+    // dialling the host again.
+    let generation = slot.next_generation();
+    let session = Arc::new(session);
+    slot.publish(generation, session.clone());
 
     let channel = session
         .channel_open_session()
@@ -261,6 +320,7 @@ async fn run(
 
     // The session handle must outlive the channel or russh tears the
     // transport down; keep it in scope until the loop finishes.
+    slot.retire(generation);
     drop(session);
     Ok(())
 }

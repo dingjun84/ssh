@@ -9,7 +9,26 @@
 
 定位是自己用的生产工具，不做商业化、不做公证分发。当前状态：**日常可用**——真实主机上登录、执行命令、中文/颜色/alt-screen 渲染、窗口尺寸同步全部验证通过；会话库、主机指纹校验、断线自动重连已落地。
 
-一句话进度：**P0 只剩「真机敲一遍 ⌘C/⌘V」，之后是 SFTP。**
+一句话进度：**剪贴板已修复并有回归测试、SFTP 面板已落地（复用同一连接），两项都待真机验收。**
+
+### 本轮接续（2026-11-13）
+
+- 修复字符快捷键使用缓存修饰键的问题，改为以 `KeyPressed.modifiers` 为准；未绑定的 Command/Ctrl 组合不会误输入字符。
+- 复制选区改用 alacritty 的 `selection_to_string()`，保留中文、多行换行与自动折行语义；空选区不覆盖系统剪贴板。
+- 粘贴支持 `BRACKETED_PASTE`，过滤内容中的 ESC，防止内容提前结束粘贴包围；普通模式将 LF/CRLF 转为 CR。复制/粘贴事件会被消费，即使没有可复制/粘贴的文本。
+- 根 Cargo manifest 新增 workspace，覆盖 vendored `iced_term` 的测试；完整验收命令改用 `cargo test --workspace --offline`。
+- **验证结果**：完整测试 37 项通过（组件 31 + 应用 6），`cargo build --offline` 通过。新增 6 项剪贴板回归测试无需启动本地 PTY、无需网络或读取用户凭据。
+- **SFTP 已实现**（`src/sftp.rs` + `Tab::sftp_ui`）：复用当前 SSH 会话，`channel_open_session()` → `request_subsystem(true, "sftp")` → `SftpSession::new(channel.into_stream())`，**不另建连接**。能力：列目录 / 进入目录 / 返回上级 / 下载到 `~/Downloads`（同名自动加 ` (1)`）/ 拖文件进窗口上传。依赖 `russh-sftp` 3.0.1（该版本把 russh 仅列为 dev-dependency，因此不吃死具体 russh 版本）。
+- **SFTP 未真机验证**：沙箱无外网（`Network is unreachable`），只做了编译 + 路径函数单测。真机一条命令即可验：`SSH_SFTP_PROBE=1 SSH_AUTOCONNECT=1 ./target/debug/ssh-client`（连上后自动打开面板并列家目录），再点文件下载、拖文件上传。
+- **顺带修掉一个测试竞态**：`store` / `hostkey` 的临时目录用时间戳命名，macOS 时钟精度只有微秒，并发跑会撞名、互相删库（`update_moves_group_and_switches_auth` 由此偶发失败）。改为「进程号 + 原子计数器」。
+
+真机剪贴板验收（用本地 shell 即可，之后再验 SSH）：
+
+1. 运行 `./target/debug/ssh-client`，点击终端，使其获得焦点。
+2. 执行 `printf '中文ABC\n第二行\n'`，拖选两行，按 ⌘C，在文本编辑器中 ⌘V，确认中文没有多余空格、两行没有粘在一起。
+3. 从文本编辑器复制中文与多行文本，在终端中运行 `cat` 后按 ⌘V，确认粘贴成功；按 Ctrl+C 退出 `cat`，确认中断仍正常。
+4. 在 zsh/bash 提示符粘贴多行文本，确认括号粘贴模式下不会提前执行；按 Ctrl+C 清空输入，再测试普通输入 `c` / `v` 不被快捷键吞掉。
+5. 连接 SSH 会话后重复复制/粘贴测试。未操作前不要将 §7 的 P0 划掉。
 
 ## 2. 环境与构建
 
@@ -19,7 +38,7 @@
 | 平台 | **仅 macOS**。`secrets.rs` 直接依赖 `security-framework`（Cargo 里声明在 `target_os = "macos"`），没有跨平台分支，换平台需自己接 keyring |
 | 构建 | `cargo build` |
 | 运行 | `./target/debug/ssh-client` |
-| 测试 | `cargo test`（会话库 + 指纹逻辑，秒级） |
+| 测试 | `cargo test --workspace --offline`（终端组件 + 会话库 + 指纹逻辑） |
 | 产物 | 单二进制，无资源目录。打包 `.app` 是 P3，没做 |
 
 > ⚠️ 必须**在真实终端里启动**。通过构建工具 / CI 通道拉起 GUI 会被沙箱掐住：读 `~/.ssh` 报 `Operation not permitted (os error 1)`，外连报 `Network is unreachable (os error 51)`。这不是代码 bug。
@@ -53,32 +72,35 @@
 
 | 文件 | 行数 | 职责 | 关键入口 |
 |---|---|---|---|
-| `main.rs` | 1423 | 全部 UI + 应用状态机 + 重连调度 | `App::boot` / `update` / `view` / `subscription` |
-| `ssh.rs` | 266 | russh 连接、认证、PTY、keepalive | `ssh::spawn(SshRequest)`、`SshEvent`、`SshTransport` |
-| `store.rs` | 455 | SQLite 会话库、分组、CRUD、迁移 | `Store::open_default`、`groups()`、`insert/update/delete` |
-| `hostkey.rs` | 162 | 主机指纹校验（TOFU） | `verify_at(host, port, key)` → `Verdict` |
+| `main.rs` | 1859 | 全部 UI + 应用状态机 + 重连调度 + SFTP 面板 | `App::boot` / `update` / `view` / `subscription` |
+| `ssh.rs` | 326 | russh 连接、认证、PTY、keepalive，以及给 SFTP 用的 `SessionSlot` | `ssh::spawn(SshRequest)`、`SshEvent`、`SshTransport`、`SessionSlot` |
+| `sftp.rs` | 421 | SFTP worker：复用会话开 subsystem、列目录、上下行传输 | `sftp::spawn(rt, slot)`、`Command`、`SftpEvent` |
+| `store.rs` | 459 | SQLite 会话库、分组、CRUD、迁移 | `Store::open_default`、`groups()`、`insert/update/delete` |
+| `hostkey.rs` | 165 | 主机指纹校验（TOFU） | `verify_at(host, port, key)` → `Verdict` |
 | `secrets.rs` | 56 | 钥匙串读写 | `set_password/password/set_passphrase/passphrase/forget` |
 | `bin/rsstest.rs` | 103 | **诊断工具，别删** | 最小 russh 连接，`WRITE_MODE=split` 复现写丢失 |
 
 `main.rs` 内部结构（1423 行不好一口气读，按这个索引跳）：
 
-- `Status`（L87）— `Local / Connecting / Connected / Closed / Reconnecting{attempt,delay} / Failed(String)`，带 `label()` 和 `color()`
-- `Tab`（L121）— 一个标签页：`term` + `transport` + `events` + `status` + `generation`
-- `backoff()` / `MAX_ATTEMPTS`（L142）— 1/2/4/8/16/30s，封顶 30，最多 8 次
-- `App`（L150）— `store` / `store_warning` / `groups` / `tabs` / `active` / `draft`
-- `Draft`（L175）— 新建与编辑共用；`from_session()` 预填普通字段，密码/口令栏**永远留空**（留空 = 不改钥匙串）
-- `Message`（L294）— 全部消息枚举，加交互从这里开始
-- `App::boot`（L343）— **注意：`boot()` 不返回就没有窗口**，进程活着也可能是零 window
-- `connect_session`（L535）/ `reconnect`（L593）/ `schedule_retry`（L637）— 重连三段
-- `SshStream`（L865）— `hash` 里**必须**带 `generation`
-- `view`（L1276）— 三栏布局
+- `Status`（L89）— `Local / Connecting / Connected / Closed / Reconnecting{attempt,delay} / Failed(String)`，带 `label()` 和 `color()`
+- `Tab`（L123）— 一个标签页：`term` + `transport` + `events` + `status` + `generation`，外加 SFTP 三件套（`sftp` handle / `sftp_events` / `sftp_ui`）
+- `backoff()` / `MAX_ATTEMPTS`（L162）— 1/2/4/8/16/30s，封顶 30，最多 8 次
+- `App`（L170）— `store` / `store_warning` / `groups` / `tabs` / `active` / `draft`
+- `Draft`（L195）— 新建与编辑共用；`from_session()` 预填普通字段，密码/口令栏**永远留空**（留空 = 不改钥匙串）
+- `Message`（L314）— 全部消息枚举，加交互从这里开始
+- `attach_sftp`（L363）— 每次连接/重连后重建 SFTP worker（旧 subsystem 通道已随连接死掉）
+- `App::boot`（L387）— **注意：`boot()` 不返回就没有窗口**，进程活着也可能是零 window
+- `connect_session`（L595）/ `reconnect`（L664）/ `schedule_retry`（L711）— 重连三段
+- `SshStream`（L1099）/ `SftpStream`（L1138）— 两者 `hash` 里**必须**带 generation
+- `sftp_panel`（L1536）— 右侧文件面板，纯读 `Tab::sftp_ui`，交互全走 Message
+- `view`（L1702）— 三栏布局，SFTP 面板按需挂在终端右侧
 
 ### 4.2 vendored `crates/iced_term`（相对上游的全部改动）
 
 | 文件 | 改了什么 | 为什么 |
 |---|---|---|
-| `backend.rs` | 新增 `trait Transport { write, resize }` + `enum Sink { Local(Notifier), Remote(Arc<dyn Transport>) }` + `Terminal::new_remote` / `set_transport` | 上游只能起本地 PTY |
-| `view.rs` | 跳过 `WIDE_CHAR_SPACER`；宽字符锚点改"跨双格中心"；CJK 显式走 PingFang SC，拉丁走等宽 | 否则中文重复绘制 / 每隔一个字丢一个 |
+| `backend.rs` | 新增 `trait Transport { write, resize }` + `enum Sink { Local(Notifier), Remote(Arc<dyn Transport>) }` + `Terminal::new_remote` / `set_transport`；`selectable_content` 改调 alacritty 的 `selection_to_string()` | 上游只能起本地 PTY；逐格拼接可见字符会丢换行、丢宽字符占位处理、带上行尾空白 |
+| `view.rs` | CJK 渲染修复；快捷键使用事件修饰键；括号粘贴、换行转换及剪贴板事件消费 | 中文渲染及剪贴板行为修复 |
 | `terminal.rs` | 事件通道关闭时 `break` 而非 `panic!` | 关标签页 drop Terminal 会让整个 UI 卡死 |
 | `bindings.rs` | ⌘C/⌘V 等剪贴板绑定（未真机验证） | — |
 
@@ -120,8 +142,9 @@ sessions (id, group_id, label, host, port, user, auth_kind,
 
 | 优先级 | 事项 | 说明 / 起点 |
 |---|---|---|
-| **P0** | 真机验证 ⌘C/⌘V | 代码已就绪（`bindings.rs` + `view.rs` 剪贴板读写），只差人手敲一遍。做完即可划掉 |
-| P1 | SFTP 面板 | **复用同一条连接**开 `sftp` subsystem，别另起连接。双栏 + 拖拽 + 传输队列 |
+| **P0** | 真机验证 ⌘C/⌘V | 已修复并有 6 项自动化测试，仍需按文首验收步骤真机操作。做完即可划掉 |
+| **P0** | 真机验证 SFTP | 代码已落地但沙箱无外网，一行命令即可验：`SSH_SFTP_PROBE=1 SSH_AUTOCONNECT=1 ./target/debug/ssh-client`。重点看：列目录、进入子目录、↑ 返回、点文件下载到 `~/Downloads`、拖文件上传、断线重连后面板仍可用 |
+| P1 | SFTP 增强 | 当前只有单栏 + 单文件串行。缺：传输队列与取消、右键菜单（改名/删除/权限）、双栏本地侧、进度条（现在是文字百分比） |
 | P1 | `~/.ssh/config` 导入 | 解析 Host/HostName/User/Port/IdentityFile/ProxyJump，批量灌库 |
 | P1 | ProxyJump / 端口转发 | 生产环境必需 |
 | P1 | 快捷命令 / 批量广播 / 分屏 | 效率件 |
@@ -175,15 +198,20 @@ cargo build --bin rsstest && ./target/debug/rsstest
 WRITE_MODE=split ./target/debug/rsstest               # 复现"写丢失"
 
 # 6. 单测
-cargo test
+cargo test --workspace --offline
+
+# 7. SFTP：连上后自动打开右侧面板并列家目录（无需点击）
+SSH_SFTP_PROBE=1 SSH_AUTOCONNECT=1 ./target/debug/ssh-client &
 ```
 
-测试环境变量：`SSH_CLIENT_DB`（换库文件）、`SSH_KNOWN_HOSTS`（换 known_hosts）、`SSH_AUTOCONNECT`（自动开第一个会话）、`SSH_OPEN_FORM[=edit]`（自动打开表单）、`SSH_PROBE`（连上后往远端敲一条命令）。
+测试环境变量：`SSH_CLIENT_DB`（换库文件）、`SSH_KNOWN_HOSTS`（换 known_hosts）、`SSH_AUTOCONNECT`（自动开第一个会话）、`SSH_OPEN_FORM[=edit]`（自动打开表单）、`SSH_PROBE`（连上后往远端敲一条命令）、`SSH_SFTP_PROBE`（连上后自动打开 SFTP 面板并列目录）。
 
 ## 10. 接手注意事项
 
 - **`crates/iced_term` 是 vendored fork，不是普通依赖**。`cargo update` 不会覆盖它，但重装/替换目录会丢改动。所有改动点已列在 §4.2。
 - **`src/bin/rsstest.rs` 和 `tools/winlist.swift` 是刻意保留的诊断工具，别删**。
+- **SFTP 不许另建连接**。`ssh::spawn` 在认证成功后把 `Arc<Handle>` 放进 `SessionSlot`，SFTP worker 靠它开第二个 channel。`russh` 的 `Handle` 不是 `Clone`，所以共享的是 `Arc`；任何**长期**持有这份 `Arc` 的代码都会让已断开的连接延迟回收，只能按操作临时借。`SessionSlot` 里的 generation 用来判断缓存的 SFTP 会话是不是上一代连接留下的（重连后必须重建）。
+- SFTP 的 `Subscription` 同样按 hash 缓存（`SftpStream`），重建 worker 后必须让 `sftp_generation` 变化，否则面板会一直听死亡通道——这个坑在本项目已经踩过三次。
 - 提交粒度按「一事一提交」，信息用 `type(scope): 中文描述`，正文写清为什么改。
-- 项目没有 CI，也没有 `AI_RULES.md` 之类的硬门槛；`cargo test` + §9 的冒烟脚本就是验收标准。
+- 项目没有 CI，也没有 `AI_RULES.md` 之类的硬门槛；`cargo test --workspace --offline` + §9 的冒烟脚本就是真实验收入口。只跑根 crate 的 `cargo test` 不足以覆盖 vendored 组件回归测试。
 - 更细的历史流水（每轮踩了什么、验证截图结论）在 `docs/PROGRESS.md`，这份文档是它的收敛版；两者冲突时以本文为准。
