@@ -6,8 +6,9 @@
 ## 一句话现状
 
 **真实 SSH 链路已经跑通**：能连 `root@43.139.142.161`，登录、执行命令、中文/颜色/alt-screen 渲染、窗口尺寸同步全部验证过。
-**会话库和主机指纹都到位了**：侧栏数据驱动（SQLite），密码/口令进钥匙串，指纹走 `~/.ssh/known_hosts` TOFU。
-下一步是**断线自动重连**（现在断了就是断了），然后 SFTP。
+**会话库、主机指纹、断线自动重连都到位了**：侧栏数据驱动（SQLite），密码/口令进钥匙串，指纹走 `~/.ssh/known_hosts` TOFU，
+掉线后按 1/2/4/8/16/30s 退避重连（最多 8 次，之后状态栏给手动重连按钮）。
+下一步是 **SFTP 面板** 和 **编辑已有会话**。
 
 ## 技术栈（已锁定，不要换）
 
@@ -45,6 +46,14 @@ enum Sink { Local(Notifier), Remote(Arc<dyn Transport>) }
 
 `Terminal::new_remote(id, settings, transport)` 是新增构造器，`Terminal::new` 保持本地 PTY 行为。
 入站：`Terminal::feed(&[u8])` 直接把远端字节喂进 VT 解析器（不经 IPC）。
+重连时用 `Terminal::set_transport(arc)` 换掉底层管道，VT 状态和 scrollback 都保留。
+
+另外修了两处上游问题，否则日常用会崩：
+
+- `terminal_subscription_stream` 在事件通道关闭时 `panic!`。关标签页（`Terminal` 被 drop）就会触发，
+  整个 UI 卡死。改成 `break` 正常结束流
+- `Subscription::run_with` **按 hash 缓存**，`TerminalSubscriptionData` 只 hash `id`。同一 id 换新
+  `Terminal` 会复用旧订阅（听死通道），所以重连**不要重建 Terminal**，改用 `set_transport`
 
 ### 3. SSH 传输层（`src/ssh.rs`）
 
@@ -75,11 +84,21 @@ Sublime2 风格的 Monokai 配色：左侧会话树 + 顶部标签栏 + 主区�
 - 非 22 端口按 `[host]:port` 命名空间隔离，与 openssh 一致
 - 连接成功后在状态栏显示 `SHA256:...` + "首次连接，已记录"/"与 known_hosts 一致"
 
+### 7. 断线重连（`src/main.rs`）
+
+- 退避：`1, 2, 4, 8, 16, 30, 30, 30`（`backoff()` 封顶 30s），最多 `MAX_ATTEMPTS = 8` 次
+- 触发点是 `SshEvent::Closed`；本地 shell（`session_id == None`）不重连
+- 连上后 `connect_attempts` 归零，下次掉线又从 1s 开始
+- 次数用尽后状态改为"失败"，状态栏出现 `↻ 重连` 按钮（手动重连会把 attempt 计数清零）
+- 重连时在终端里留一行 `—— 重连 <label> ——` 作分隔，旧输出不清
+- 定时器用 `Task::perform(tokio::time::sleep)`，没有额外线程
+- **`SshStream` 的 hash 必须带上 `generation`**：`Subscription::run_with` 按 hash 缓存，重连换了
+  receiver 但 hash 不变的话，UI 会一直听那条已关闭的旧通道（表现为状态永远停在"连接中"）
+
 ## 未完成（按优先级）
 
 | 优先级 | 事项 | 说明 |
 |---|---|---|
-| **P0** | **断线重连（指数退避）** | 现在断了就是断了，状态栏变"已断开"。`Tab` 已经记了 `session_id`，重建连接有落脚点 |
 | P0 | 复制粘贴 | 代码层面已具备：`view.rs` 有 clipboard 读写，`bindings.rs` 绑了 ⌘C/⌘V，但**没有手动敲键验证过**（当前测试环境点不到窗口，也没法按键）。真机自测一遍再划掉 |
 | P0 | 编辑已有会话 | 现在只能新建/删除，改分组或换私钥得删了重建 |
 | P1 | SFTP 面板 | 复用同一个连接开 sftp subsystem，双栏 + 拖拽 + 传输队列 |
@@ -104,6 +123,8 @@ Sublime2 风格的 Monokai 配色：左侧会话树 + 顶部标签栏 + 主区�
 9. **`learn_known_hosts` 给空文件写记录会先写一个空行**（`seek(End(-1))` 在 0 字节文件上失败 → 判定"没有换行"）。openssh 会跳过空行，不影响功能，但会污染用户的 known_hosts。要么自己写追加逻辑，要么别往空文件里写。
 10. **通过构建/CI 通道启动 GUI 会被沙箱掐住**：`~/.ssh` 读私钥报 `Operation not permitted (os error 1)`，外连报 `Network is unreachable (os error 51)`。这不是代码 bug，在终端里手动 `./target/debug/ssh-client` 启动就正常。验证连接一定要在真实终端里跑。
 11. `SSH_PROBE` 现在在传输层发送并**延时 1.2s**：太早写会在远端 shell 还没起来时被 PTY 丢掉（表现为"命令输入了但没输出"）。
+12. **`Terminal` 初始是 0 行高**，在第一次 layout/resize 之前 `feed()` 进去的字节会被丢掉。所以别指望"连上之前"塞的欢迎语能显示，重连分隔线偶尔也会被吞。
+13. `Subscription::run_with` 用 hash 当 key，**任何"换内部通道"的操作都必须让 hash 变**。这个坑踩了两次（自己的 SshStream、iced_term 的 Terminal 订阅各一次），表现都是"状态卡住不动、终端空白"。
 
 ## 怎么验证（无键盘也能跑）
 
@@ -168,7 +189,21 @@ cargo test
 | 写方向（`SSH_PROBE`） | 通过（远端执行 `hostname; echo FP_OK` → `VM-0-2-opencloudos` / `FP_OK`） |
 | 添加会话表单渲染 | 通过（右侧抽屉，字段/私钥密码切换/保存取消按钮布局正常） |
 
+### 断线重连（2026-11-13 第三轮）
+
+| 项 | 结果 |
+|---|---|
+| 连接被拒时的退避 | 通过（`127.0.0.1:1` 连续失败，状态栏依次 `第1次 1s` → `第4次 8s` → `第5次 16s`） |
+| 真实掉线自动重连 | 通过（`SSH_PROBE="echo WILL_EXIT; sleep 3; exit"`：logout 后用 1s 重连，出现第二条登录 banner + 新提示符） |
+| 重连后 scrollback | 通过（旧输出仍在，`—— 重连 <host> ——` 作分隔） |
+| 重连后事件通道 | 通过（gen 修复前卡在"连接中"，修复后正常收到数据） |
+| `connect_count` 计数 | 通过（一次首连 + 一次重连 = 17→19） |
+| 关标签页不再 panic | 通过（原先 `terminal event channel closed unexpected` 会让整个 UI 卡死） |
+
 ## 下一步建议
 
-先做**断线重连**，这是最后一个"日常用不顺"的 P0：`Tab.session_id` 已经在，重连就是把 `open_session` 的建连部分抽出来复用 + 退避定时器。
-之后是 SFTP（复用同一连接开 subsystem）。
+P0 只剩两件：**编辑已有会话**（改分组/换私钥，别逼人删了重建）和**真机验证 ⌘C/⌘V**。
+之后上 SFTP：复用同一条连接开 `sftp` subsystem，别另起连接。
+
+再往下值得考虑的：状态栏双指标（协议层 RTT + 终端最后输出时间），因为 keepalive 通不代表 shell 活着——
+现在掉线判断完全依赖通道关闭事件，遇到"TCP 半死"会假死。

@@ -89,24 +89,29 @@ enum Status {
     Connecting,
     Connected,
     Closed,
+    /// Waiting out an exponential backoff before the next attempt.
+    Reconnecting { attempt: u32, delay: u64 },
     Failed(String),
 }
 
 impl Status {
-    fn label(&self) -> &str {
+    fn label(&self) -> String {
         match self {
-            Status::Local => "本地",
-            Status::Connecting => "连接中",
-            Status::Connected => "已连接",
-            Status::Closed => "已断开",
-            Status::Failed(_) => "失败",
+            Status::Local => "本地".into(),
+            Status::Connecting => "连接中".into(),
+            Status::Connected => "已连接".into(),
+            Status::Closed => "已断开".into(),
+            Status::Reconnecting { attempt, delay } => {
+                format!("重连中 · 第{attempt}次 · {delay}s 后")
+            },
+            Status::Failed(_) => "失败".into(),
         }
     }
 
     fn color(&self) -> Color {
         match self {
             Status::Local | Status::Connected => ACCENT,
-            Status::Connecting => WARN,
+            Status::Connecting | Status::Reconnecting { .. } => WARN,
             Status::Closed => DIM,
             Status::Failed(_) => DANGER,
         }
@@ -125,7 +130,22 @@ struct Tab {
     fingerprint: Option<String>,
     /// Trust-on-first-use note shown next to the fingerprint.
     fingerprint_note: Option<&'static str>,
+    /// How many automatic reconnect attempts have been spent on this tab.
+    connect_attempts: u32,
+    /// Bumped on every reconnect. `Subscription::run_with` caches by hash, so
+    /// without this the widget would keep listening on the *old*, closed event
+    /// channel and never see anything again.
+    generation: u64,
 }
+
+/// Backoff schedule: 1, 2, 4, 8, 16, then a 30s ceiling.
+fn backoff(attempt: u32) -> u64 {
+    (1u64 << attempt.min(4)).min(30)
+}
+
+/// Give up after this many automatic attempts; the status bar still offers a
+/// manual retry.
+const MAX_ATTEMPTS: u32 = 8;
 
 struct App {
     store: Store,
@@ -254,6 +274,10 @@ enum Message {
     AskDelete(i64),
     ConfirmDelete,
     CancelDelete,
+    /// Backoff timer fired for a tab.
+    Reconnect(u64),
+    /// User pressed the status-bar retry button.
+    Retry,
 }
 
 fn spawn_local(id: u64, program: &str, args: Vec<String>) -> Terminal {
@@ -365,6 +389,8 @@ impl App {
             status: Status::Local,
             fingerprint: None,
             fingerprint_note: None,
+            connect_attempts: 0,
+            generation: 0,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -412,6 +438,8 @@ sleep 1800
             status: Status::Local,
             fingerprint: None,
             fingerprint_note: None,
+            connect_attempts: 0,
+            generation: 0,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -435,41 +463,10 @@ sleep 1800
         let id = self.next_id;
         self.next_id += 1;
 
-        let mut error: Option<String> = None;
-        let auth = match &session.auth {
-            AuthKind::Key { path } => Auth::Key {
-                path: shellexpand(path),
-                passphrase: match secrets::passphrase(session.id) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        error = Some(e);
-                        None
-                    },
-                },
-            },
-            AuthKind::Password => match secrets::password(session.id) {
-                Ok(Some(password)) => Auth::Password(password),
-                Ok(None) => {
-                    return self.open_failed(&session, "会话库里没有保存密码".into());
-                },
-                Err(e) => return self.open_failed(&session, e),
-            },
+        let (transport, rx) = match self.connect_session(&session) {
+            Ok(connected) => connected,
+            Err(err) => return self.open_failed(&session, err),
         };
-        if let Some(err) = error {
-            return self.open_failed(&session, err);
-        }
-
-        let (transport, rx) = ssh::spawn(
-            &runtime(),
-            SshRequest {
-                host: session.host.clone(),
-                port: session.port,
-                user: session.user.clone(),
-                auth,
-                cols: 100,
-                rows: 30,
-            },
-        );
 
         let term = Terminal::new_remote(id, term_settings(), transport.clone());
 
@@ -483,10 +480,41 @@ sleep 1800
             status: Status::Connecting,
             fingerprint: None,
             fingerprint_note: None,
+            connect_attempts: 0,
+            generation: 0,
         });
         self.active = self.tabs.len() - 1;
         let _ = self.store.touch(session.id);
+    }
 
+    /// Resolves the credentials and kicks off a connection attempt. Shared by
+    /// the first connect and every reconnect.
+    fn connect_session(
+        &self,
+        session: &Session,
+    ) -> Result<(Arc<ssh::SshTransport>, UnboundedReceiver<SshEvent>), String> {
+        let auth = match &session.auth {
+            AuthKind::Key { path } => Auth::Key {
+                path: shellexpand(path),
+                passphrase: secrets::passphrase(session.id)?,
+            },
+            AuthKind::Password => match secrets::password(session.id)? {
+                Some(password) => Auth::Password(password),
+                None => return Err("会话库里没有保存密码".into()),
+            },
+        };
+
+        Ok(ssh::spawn(
+            &runtime(),
+            SshRequest {
+                host: session.host.clone(),
+                port: session.port,
+                user: session.user.clone(),
+                auth,
+                cols: 100,
+                rows: 30,
+            },
+        ))
     }
 
     /// Opens a tab that shows nothing but the failure, so the reason is
@@ -506,12 +534,86 @@ sleep 1800
             status: Status::Failed(error),
             fingerprint: None,
             fingerprint_note: None,
+            connect_attempts: 0,
+            generation: 0,
         });
         self.active = self.tabs.len() - 1;
     }
 
     fn tab_index_for(&self, id: u64) -> Option<usize> {
         self.tabs.iter().position(|t| t.id == id)
+    }
+
+    /// Rebuilds the transport for a tab that lost its connection. The terminal
+    /// is recreated too — a fresh remote shell means a fresh VT, and iced_term
+    /// has no way to swap the transport underneath an existing one.
+    fn reconnect(&mut self, tab_id: u64) -> Task<Message> {
+        let Some(index) = self.tab_index_for(tab_id) else {
+            return Task::none();
+        };
+        if !matches!(
+            self.tabs[index].status,
+            Status::Closed | Status::Failed(_) | Status::Reconnecting { .. }
+        ) {
+            // Already connected or mid-handshake: a stale timer, ignore it.
+            return Task::none();
+        }
+        let Some(session_id) = self.tabs[index].session_id else {
+            return Task::none();
+        };
+        let Some(session) = self.find_session(session_id) else {
+            self.tabs[index].status = Status::Failed("会话已从库中删除".into());
+            return Task::none();
+        };
+
+        match self.connect_session(&session) {
+            Ok((transport, rx)) => {
+                let tab = &mut self.tabs[index];
+                // Keep the terminal (and its scrollback); only the pipe
+                // underneath changes.
+                tab.term.set_transport(transport.clone());
+                tab.term
+                    .feed(format!("\r\n\x1b[2m—— 重连 {} ——\x1b[0m\r\n", session.label).as_bytes());
+                tab.transport = Some(transport);
+                tab.events = Some(Arc::new(Mutex::new(rx)));
+                tab.generation += 1;
+                tab.status = Status::Connecting;
+                tab.fingerprint = None;
+                tab.fingerprint_note = None;
+                let _ = self.store.touch(session.id);
+                Task::none()
+            },
+            Err(err) => {
+                self.tabs[index].status = Status::Failed(err);
+                self.schedule_retry(index)
+            },
+        }
+    }
+
+    /// Arms the backoff timer for the next attempt.
+    fn schedule_retry(&mut self, index: usize) -> Task<Message> {
+        let tab = &mut self.tabs[index];
+        if tab.connect_attempts >= MAX_ATTEMPTS || tab.session_id.is_none() {
+            tab.status = Status::Failed(match &tab.status {
+                Status::Failed(err) => err.clone(),
+                _ => "重连次数用尽".into(),
+            });
+            return Task::none();
+        }
+
+        let delay = backoff(tab.connect_attempts);
+        tab.connect_attempts += 1;
+        tab.status = Status::Reconnecting {
+            attempt: tab.connect_attempts,
+            delay,
+        };
+        let tab_id = tab.id;
+        Task::perform(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            },
+            move |_| Message::Reconnect(tab_id),
+        )
     }
 }
 
@@ -545,6 +647,9 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
                     },
                     SshEvent::Connected => {
                         tab.status = Status::Connected;
+                        // A successful handshake resets the backoff so the next
+                        // drop starts at 1s again.
+                        tab.connect_attempts = 0;
                     },
                     SshEvent::Error(err) => {
                         tab.status = Status::Failed(err.clone());
@@ -555,8 +660,23 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
                         if !matches!(tab.status, Status::Failed(_)) {
                             tab.status = Status::Closed;
                         }
+                        // Local tabs have no session to reconnect to; remote
+                        // ones retry with backoff until MAX_ATTEMPTS.
+                        if tab.session_id.is_some() {
+                            return state.schedule_retry(index);
+                        }
                     },
                 }
+            }
+        },
+        Message::Reconnect(tab_id) => return state.reconnect(tab_id),
+        Message::Retry => {
+            if let Some(id) = state.tabs.get(state.active).map(|t| t.id) {
+                // A manual retry should not be blocked by the spent budget.
+                if let Some(index) = state.tab_index_for(id) {
+                    state.tabs[index].connect_attempts = 0;
+                }
+                return state.reconnect(id);
             }
         },
         Message::OpenUtility(target) => match target {
@@ -675,12 +795,16 @@ fn shellexpand(path: &str) -> String {
 #[derive(Clone)]
 struct SshStream {
     id: u64,
+    /// Distinguishes successive connections of the same tab, so a reconnect
+    /// produces a new subscription instead of reusing the dead channel.
+    generation: u64,
     rx: Arc<Mutex<UnboundedReceiver<SshEvent>>>,
 }
 
 impl Hash for SshStream {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
+        self.generation.hash(state);
     }
 }
 
@@ -718,6 +842,7 @@ fn subscription(state: &App) -> Subscription<Message> {
                 Subscription::run_with(
                     SshStream {
                         id: tab.id,
+                        generation: tab.generation,
                         rx: rx.clone(),
                     },
                     ssh_stream,
@@ -1095,7 +1220,7 @@ fn view(state: &App) -> Element<'_, Message> {
     let active_tab = state.tabs.get(state.active);
     let status_text = match active_tab.map(|t| &t.status) {
         Some(Status::Failed(err)) => err.clone(),
-        Some(status) => status.label().to_string(),
+        Some(status) => status.label(),
         None => "—".to_string(),
     };
     let fingerprint = active_tab
@@ -1104,20 +1229,37 @@ fn view(state: &App) -> Element<'_, Message> {
     let fingerprint_note = active_tab
         .and_then(|t| t.fingerprint_note)
         .unwrap_or("");
+    // Retry is offered whenever the tab has a session but no live connection.
+    let can_retry = active_tab
+        .map(|t| {
+            t.session_id.is_some()
+                && matches!(t.status, Status::Closed | Status::Failed(_))
+        })
+        .unwrap_or(false);
 
-    let status = container(
-        row![
-            text("●")
-                .size(9)
-                .color(active_tab.map(|t| t.status.color()).unwrap_or(DIM)),
-            text(status_text).size(10).color(FG),
-            text(fingerprint).size(10).color(DIM),
-            text(fingerprint_note).size(10).color(ACCENT),
-            text("keepalive 30s / max 4").size(10).color(DIM),
-            text("alacritty 0.25 · iced 0.14").size(10).color(DIM),
-        ]
-        .spacing(12),
-    )
+    let mut status_row = row![
+        text("●")
+            .size(9)
+            .color(active_tab.map(|t| t.status.color()).unwrap_or(DIM)),
+        text(status_text).size(10).color(FG),
+        text(fingerprint).size(10).color(DIM),
+        text(fingerprint_note).size(10).color(ACCENT),
+        text("keepalive 30s / max 4").size(10).color(DIM),
+        text("alacritty 0.25 · iced 0.14").size(10).color(DIM),
+    ]
+    .spacing(12)
+    .align_y(iced::Alignment::Center);
+
+    if can_retry {
+        status_row = status_row.push(
+            button(text("↻ 重连").size(10).color(ACCENT))
+                .on_press(Message::Retry)
+                .padding([1, 6])
+                .style(flat_button),
+        );
+    }
+
+    let status = container(status_row)
     .width(Length::Fill)
     .height(Length::Fixed(24.0))
     .padding([0, 10])
