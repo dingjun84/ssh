@@ -79,6 +79,7 @@
 | `hostkey.rs` | 165 | 主机指纹校验（TOFU） | `verify_at(host, port, key)` → `Verdict` |
 | `secrets.rs` | 56 | 钥匙串读写 | `set_password/password/set_passphrase/passphrase/forget` |
 | `bin/rsstest.rs` | 103 | **诊断工具，别删** | 最小 russh 连接，`WRITE_MODE=split` 复现写丢失 |
+| `bin/sftpprobe.rs` | 322 | **诊断工具，别删** | 复用 `ssh.rs`/`sftp.rs` 对真实服务端跑完 SFTP 全流程，退出码 0 = 全过 |
 
 `main.rs` 内部结构（1423 行不好一口气读，按这个索引跳）：
 
@@ -143,7 +144,8 @@ sessions (id, group_id, label, host, port, user, auth_kind,
 | 优先级 | 事项 | 说明 / 起点 |
 |---|---|---|
 | **P0** | 真机验证 ⌘C/⌘V | 已修复并有 6 项自动化测试，仍需按文首验收步骤真机操作。做完即可划掉 |
-| **P0** | 真机验证 SFTP | 代码已落地但沙箱无外网，一行命令即可验：`SSH_SFTP_PROBE=1 SSH_AUTOCONNECT=1 ./target/debug/ssh-client`。重点看：列目录、进入子目录、↑ 返回、点文件下载到 `~/Downloads`、拖文件上传、断线重连后面板仍可用 |
+| **P0** | 真机点一遍 SFTP 面板 | 核心链路已用本地实验台跑通（§9 第 8、9 条）：列目录、子目录、4 MiB 下载逐字节一致、上传回落校验、报错后自愈、断线重连后重新列目录。**只剩鼠标路径没验**：点文件下载到 `~/Downloads`、把文件拖进窗口上传 |
+| P2 | 重连后终端里没有提示 | 断线重连后 SFTP 面板会刷新（已验证），但终端看不到「—— 重连 ——」和重连后的 shell 输出。怀疑 `Terminal::feed` 只 `cache.clear()` 而没有请求重绘，要等下一次无关重绘才更新；取证时屏幕已锁，下次复现再确认 |
 | P1 | SFTP 增强 | 当前只有单栏 + 单文件串行。缺：传输队列与取消、右键菜单（改名/删除/权限）、双栏本地侧、进度条（现在是文字百分比） |
 | P1 | `~/.ssh/config` 导入 | 解析 Host/HostName/User/Port/IdentityFile/ProxyJump，批量灌库 |
 | P1 | ProxyJump / 端口转发 | 生产环境必需 |
@@ -202,14 +204,27 @@ cargo test --workspace --offline
 
 # 7. SFTP：连上后自动打开右侧面板并列家目录（无需点击）
 SSH_SFTP_PROBE=1 SSH_AUTOCONNECT=1 ./target/debug/ssh-client &
+
+# 8. 没有可连的服务器时，起一个本地 SFTP 实验台（asyncssh）
+python3 -m pip install asyncssh
+python3 tools/sftp_lab.py                             # 127.0.0.1:2244 · lab / labpass
+# 主机密钥固定在 <LAB_ROOT>/../hostkey，重启不换，否则 TOFU 会（正确地）拒绝
+
+# 9. 不开 GUI 跑通列目录 / 下载 / 上传 / 错误恢复，退出码 0 = 全过
+SSH_KNOWN_HOSTS=/tmp/sftp-lab/kh LAB_USER=lab LAB_PASS=labpass \
+  ./target/debug/sftpprobe
 ```
+
+`sftpprobe` 用 `#[path]` 直接引入 `ssh.rs` / `sftp.rs`，跑的就是面板本身那份代码，不是另写的实现。它按顺序验 8 项：握手与指纹 → 开 sftp 子系统 → 列目录 → 小文件下载 → 4 MiB 分块下载（逐字节比对）→ 上传到根与子目录（读回服务端落盘文件比对 UTF-8/emoji）→ 缺文件报错 → 报错后仍能继续列目录（缓存会话已丢弃并重建）。
+
+`SSH_SFTP_PROBE` 之外，GUI 冒烟要带 `SSH_CLIENT_DB` 指向一次性库；**不要用 `HOME=` 覆盖来隔离 known_hosts**，macOS 的钥匙串路径跟着 `HOME` 走，会读不到密码。用 `SSH_KNOWN_HOSTS`。
 
 测试环境变量：`SSH_CLIENT_DB`（换库文件）、`SSH_KNOWN_HOSTS`（换 known_hosts）、`SSH_AUTOCONNECT`（自动开第一个会话）、`SSH_OPEN_FORM[=edit]`（自动打开表单）、`SSH_PROBE`（连上后往远端敲一条命令）、`SSH_SFTP_PROBE`（连上后自动打开 SFTP 面板并列目录）。
 
 ## 10. 接手注意事项
 
 - **`crates/iced_term` 是 vendored fork，不是普通依赖**。`cargo update` 不会覆盖它，但重装/替换目录会丢改动。所有改动点已列在 §4.2。
-- **`src/bin/rsstest.rs` 和 `tools/winlist.swift` 是刻意保留的诊断工具，别删**。
+- **`src/bin/rsstest.rs`、`src/bin/sftpprobe.rs`、`tools/winlist.swift`、`tools/sftp_lab.py` 是刻意保留的诊断工具，别删**。
 - **SFTP 不许另建连接**。`ssh::spawn` 在认证成功后把 `Arc<Handle>` 放进 `SessionSlot`，SFTP worker 靠它开第二个 channel。`russh` 的 `Handle` 不是 `Clone`，所以共享的是 `Arc`；任何**长期**持有这份 `Arc` 的代码都会让已断开的连接延迟回收，只能按操作临时借。`SessionSlot` 里的 generation 用来判断缓存的 SFTP 会话是不是上一代连接留下的（重连后必须重建）。
 - SFTP 的 `Subscription` 同样按 hash 缓存（`SftpStream`），重建 worker 后必须让 `sftp_generation` 变化，否则面板会一直听死亡通道——这个坑在本项目已经踩过三次。
 - 提交粒度按「一事一提交」，信息用 `type(scope): 中文描述`，正文写清为什么改。
