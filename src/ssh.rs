@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use iced_term::Transport;
@@ -8,6 +8,8 @@ use russh::ChannelMsg;
 use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver, UnboundedSender,
 };
+
+use crate::hostkey;
 
 /// Messages the UI needs to push towards the remote host.
 enum Outbound {
@@ -20,6 +22,11 @@ enum Outbound {
 #[derive(Debug, Clone)]
 pub enum SshEvent {
     Data(Vec<u8>),
+    /// Emitted right after the host key has been verified (or pinned).
+    HostKey {
+        fingerprint: String,
+        learned: bool,
+    },
     Connected,
     Error(String),
     Closed,
@@ -58,18 +65,27 @@ pub struct SshRequest {
     pub rows: u16,
 }
 
-struct Handler;
+struct Handler {
+    host: String,
+    port: u16,
+    /// Filled in by `check_server_key` so the caller can surface the
+    /// fingerprint (or the rejection reason) once the handshake settles.
+    verdict: Arc<StdMutex<Option<Result<hostkey::Verdict, String>>>>,
+}
 
 impl client::Handler for Handler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _key: &PublicKeyOrCertificate,
+        key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        // Trust-on-first-use. Host key pinning lands with the session store;
-        // until then we accept but surface the fingerprint in the status bar.
-        Ok(true)
+        let outcome = hostkey::verify(&self.host, self.port, &key.public_key());
+        let accept = outcome.is_ok();
+        *self.verdict.lock().unwrap() = Some(outcome);
+        // Returning false makes russh abort the handshake; the concrete reason
+        // travels through the shared slot instead of a generic "unknown key".
+        Ok(accept)
     }
 }
 
@@ -108,10 +124,32 @@ async fn run(
         ..Default::default()
     });
 
-    let mut session =
-        client::connect(config, (req.host.as_str(), req.port), Handler)
-            .await
-            .map_err(|e| format!("连接 {}:{} 失败: {e}", req.host, req.port))?;
+    let verdict_slot = Arc::new(StdMutex::new(None));
+    let handler = Handler {
+        host: req.host.clone(),
+        port: req.port,
+        verdict: verdict_slot.clone(),
+    };
+
+    let connected = client::connect(config, (req.host.as_str(), req.port), handler).await;
+
+    // A rejected host key surfaces as a generic handshake failure, so consult
+    // the slot first to report the real reason (mismatch vs. unreachable).
+    let last_verdict = verdict_slot.lock().unwrap().clone();
+    let mut session = match (connected, last_verdict) {
+        (_, Some(Err(reason))) => return Err(reason),
+        (Ok(session), _) => session,
+        (Err(e), _) => {
+            return Err(format!("连接 {}:{} 失败: {e}", req.host, req.port));
+        },
+    };
+
+    if let Some(Ok(verdict)) = verdict_slot.lock().unwrap().clone() {
+        let _ = evt.send(SshEvent::HostKey {
+            fingerprint: verdict.fingerprint,
+            learned: verdict.trust == hostkey::Trust::Learned,
+        });
+    }
 
     match &req.auth {
         Auth::Password(password) => {
@@ -172,6 +210,16 @@ async fn run(
 
     let (mut read_half, write_half) = channel.split();
     let _ = evt.send(SshEvent::Connected);
+
+    // Unattended smoke test: type a command into the remote shell so the write
+    // direction can be verified without a keyboard. Delayed, because bytes sent
+    // before the shell prints its first prompt get swallowed by the PTY setup.
+    if let Ok(probe) = std::env::var("SSH_PROBE") {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let _ = write_half
+            .data_bytes(format!("{probe}\n").into_bytes())
+            .await;
+    }
 
     // Single task, `select!` over both directions. An earlier version spawned
     // a second task for the write side and it would sometimes never be polled

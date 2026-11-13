@@ -6,7 +6,8 @@
 ## 一句话现状
 
 **真实 SSH 链路已经跑通**：能连 `root@43.139.142.161`，登录、执行命令、中文/颜色/alt-screen 渲染、窗口尺寸同步全部验证过。
-**还没有会话库**——侧栏是硬编码的两条，SFTP 也没做。下一步是 SQLite + Keychain。
+**会话库和主机指纹都到位了**：侧栏数据驱动（SQLite），密码/口令进钥匙串，指纹走 `~/.ssh/known_hosts` TOFU。
+下一步是**断线自动重连**（现在断了就是断了），然后 SFTP。
 
 ## 技术栈（已锁定，不要换）
 
@@ -56,25 +57,39 @@ enum Sink { Local(Notifier), Remote(Arc<dyn Transport>) }
 ### 4. 界面骨架（`src/main.rs`）
 
 Sublime2 风格的 Monokai 配色：左侧会话树 + 顶部标签栏 + 主区终端 + 底部状态栏。
-状态栏显示连接状态、keepalive 参数。窗口用 `Level::AlwaysOnTop` + 固定位置（方便截图验证）。
+状态栏显示连接状态、主机指纹、keepalive 参数。窗口用 `Level::AlwaysOnTop` + 固定位置（方便截图验证）。
+
+### 5. 会话库（`src/store.rs` + `src/secrets.rs`）
+
+- SQLite 落在 `~/Library/Application Support/ssh-client/sessions.db`，WAL 模式，外键打开
+- 表结构：`groups(id,name,sort_order)` + `sessions(id,group_id,label,host,port,user,auth_kind,key_path,sort_order,connect_count,last_used_at)`。**密码不落库**，`sessions` 只记去哪取
+- 密码/私钥口令进 macOS 登录钥匙串：`service=ssh-client`，`account=session:<id>:password|passphrase`（`security-framework` 的 `passwords` 模块）
+- 首次启动自动播种一条开发主机（`43.139.142.161` / root / `~/.ssh/id_rsa`）
+- 侧栏改成数据驱动：分组 → 会话，点开自动去重（同会话只开一个标签）。右侧抽屉是"添加会话"表单，`×` 走二次确认删除并清理钥匙串条目
+- 库打不开时退化为内存库并在侧栏顶部给出警告，不让整个 app 起不来
+
+### 6. 主机指纹校验（`src/hostkey.rs`）
+
+- 直接复用 `~/.ssh/known_hosts` 当唯一真相源，不另建私有存储：这里学到的记录命令行 `ssh` 也认，反之亦然
+- TOFU：首次连接 pin 住指纹（`learn_known_hosts_path`），之后每次比对；**变更即拒绝连接**，错误信息带上"服务器出示 X / known_hosts 第 N 行是 Y"和处置建议
+- 非 22 端口按 `[host]:port` 命名空间隔离，与 openssh 一致
+- 连接成功后在状态栏显示 `SHA256:...` + "首次连接，已记录"/"与 known_hosts 一致"
 
 ## 未完成（按优先级）
 
 | 优先级 | 事项 | 说明 |
 |---|---|---|
-| **P0** | **会话库（SQLite + Keychain）** | 侧栏目前硬编码。需要 sessions 表 + 分组 + 密码进 Keychain |
-| **P0** | **主机指纹校验** | 现在 `check_server_key` 直接 `Ok(true)`，**接受任意主机密钥，等于没有中间人防护**。至少要 TOFU：首次存指纹，变更时告警 |
-| P0 | 断线重连（指数退避） | 现在断了就是断了，状态栏变"已断开" |
-| P0 | 复制粘贴 | 未验证 iced_term 是否处理 ⌘C/⌘V，很可能是缺的 |
+| **P0** | **断线重连（指数退避）** | 现在断了就是断了，状态栏变"已断开"。`Tab` 已经记了 `session_id`，重建连接有落脚点 |
+| P0 | 复制粘贴 | 代码层面已具备：`view.rs` 有 clipboard 读写，`bindings.rs` 绑了 ⌘C/⌘V，但**没有手动敲键验证过**（当前测试环境点不到窗口，也没法按键）。真机自测一遍再划掉 |
+| P0 | 编辑已有会话 | 现在只能新建/删除，改分组或换私钥得删了重建 |
 | P1 | SFTP 面板 | 复用同一个连接开 sftp subsystem，双栏 + 拖拽 + 传输队列 |
-| P1 | `~/.ssh/config` 导入 | 解析 Host/HostName/User/Port/IdentityFile/ProxyJump |
-| P1 | 密码认证 UI | `Auth::Password` 已实现但没有输入入口 |
+| P1 | `~/.ssh/config` 导入 | 解析 Host/HostName/User/Port/IdentityFile/ProxyJump，批量灌进会话库 |
 | P1 | ProxyJump / 端口转发 | 生产环境必需 |
 | P1 | 快捷命令 / 批量广播 / 分屏 | 效率件 |
 | P2 | 状态栏双指标 | 协议层 RTT + 终端最后输出时间（keepalive 通不代表 shell 活着） |
 | P2 | 合盖唤醒后立即探测一轮 | 系统唤醒事件监听 |
 | P2 | 滚动缓冲 / 终端内搜索 | alacritty 有 scrollback，但要确认 iced_term 的绘制是否支持滚动偏移 |
-| P3 | 打包 .app + ad-hoc 签名 | 本地自用，不做公证 |
+| P3 | 打包 .app + ad-hoc 签名 | 本地自用，不做公证；顺带解决钥匙串每次重新授权的问题 |
 
 ## 已知坑（别再踩一遍）
 
@@ -85,24 +100,41 @@ Sublime2 风格的 Monokai 配色：左侧会话树 + 顶部标签栏 + 主区�
 5. **`boot()` 在 tokio 任务里执行**，它不返回就不会有窗口——app 进程活着但一个 window 都没有，别误判成渲染问题。用 `swift` + `CGWindowListCopyWindowInfo` 查窗口是否存在最可靠。
 6. Apple Events 未授权（`-1743`），`osascript` 无法前置/操作窗口。截图用 `screencapture -x -o -l <windowID>`，windowID 从上面的 Swift 脚本拿。
 7. iced_term 的 `TerminalView` 是逐格调用 `fill_text`，功能键/剪贴板等交互能力要逐个确认，别假设它有。
+8. **russh 的 `check_known_hosts` 把密钥注释算进相等性**（`ssh_key::PublicKey` 的 `PartialEq` 派生覆盖 `comment`）。用它的返回值判断"密钥是否变更"会在注释不一致时误报中间人攻击。已改成自己按指纹比对。
+9. **`learn_known_hosts` 给空文件写记录会先写一个空行**（`seek(End(-1))` 在 0 字节文件上失败 → 判定"没有换行"）。openssh 会跳过空行，不影响功能，但会污染用户的 known_hosts。要么自己写追加逻辑，要么别往空文件里写。
+10. **通过构建/CI 通道启动 GUI 会被沙箱掐住**：`~/.ssh` 读私钥报 `Operation not permitted (os error 1)`，外连报 `Network is unreachable (os error 51)`。这不是代码 bug，在终端里手动 `./target/debug/ssh-client` 启动就正常。验证连接一定要在真实终端里跑。
+11. `SSH_PROBE` 现在在传输层发送并**延时 1.2s**：太早写会在远端 shell 还没起来时被 PTY 丢掉（表现为"命令输入了但没输出"）。
 
 ## 怎么验证（无键盘也能跑）
 
 ```bash
-# 1. 起一个真实会话并截图
+# 1. 起一个真实会话并截图（必须在真实终端里跑，见坑 10）
 SSH_AUTOCONNECT=1 ./target/debug/ssh-client &
 swift tools/winlist.swift | grep "SSH 工作台"      # 拿 windowID
 screencapture -x -o -l <windowID> /tmp/shot.png
 
-# 2. 连上后自动在远端执行一段命令（验证写入方向）
-SSH_PROBE="stty size
-" SSH_AUTOCONNECT=1 ./target/debug/ssh-client &
+# 2. 隔离冒烟：不碰真实会话库和 known_hosts
+mkdir -p /tmp/smoke && : > /tmp/smoke/known_hosts
+SSH_CLIENT_DB=/tmp/smoke/sessions.db \
+SSH_KNOWN_HOSTS=/tmp/smoke/known_hosts \
+SSH_AUTOCONNECT=1 SSH_PROBE="hostname; echo FP_OK" ./target/debug/ssh-client &
+
+# 3. 只看"添加会话"表单布局（不需要点按钮）
+SSH_OPEN_FORM=1 ./target/debug/ssh-client &
+
+# 4. 连上后自动在远端执行一段命令（验证写入方向）
+SSH_PROBE="stty size" SSH_AUTOCONNECT=1 ./target/debug/ssh-client &
 # 期望终端里出现 46 154，与本地 resize 日志一致
 
-# 3. 单独验证 russh（排除终端层干扰）
+# 5. 单独验证 russh（排除终端层干扰）
 cargo build --bin rsstest && ./target/debug/rsstest
 WRITE_MODE=split ./target/debug/rsstest
+
+# 6. 单元测试（会话库 + 指纹逻辑都是纯函数，跑得很快）
+cargo test
 ```
+
+可用的测试环境变量：`SSH_CLIENT_DB`（换库文件）、`SSH_KNOWN_HOSTS`（换 known_hosts）、`SSH_AUTOCONNECT`（自动开第一个会话）、`SSH_OPEN_FORM`（自动打开添加表单）、`SSH_PROBE`（连上后往远端敲一条命令）。
 
 `src/bin/rsstest.rs` 是刻意保留的诊断工具：最小 russh 连接 + 两种写入策略，用来区分"库的问题"和"我的集成问题"。别删。
 
@@ -124,7 +156,19 @@ WRITE_MODE=split ./target/debug/rsstest
 | 窗口尺寸同步 | 通过（本地 154x46 → 远端 `stty size` 返回 `46 154`） |
 | emoji | 通过 |
 
+### 会话库 / 指纹（2026-11-13 第二轮）
+
+| 项 | 结果 |
+|---|---|
+| 首次启动播种 + 侧栏数据驱动 | 通过（`生产环境 · 1`，`43.139.142.161 / root · 私钥`） |
+| 会话写入 → 落库 → 读回 | 通过（`cargo test` 覆盖分组、端口、私钥路径往返） |
+| TOFU 首次 pin | 通过（空 known_hosts 连一次后写入 `43.139.142.161 ssh-ed25519 AAAA…DVHLV`） |
+| 二次连接判定为已知 | 通过（状态栏"与 known_hosts 一致"，且与 openssh 自己记的 ed25519 指纹相同） |
+| 密钥变更拒绝 | 通过（单测：换一把 key 后报"主机密钥已变更"） |
+| 写方向（`SSH_PROBE`） | 通过（远端执行 `hostname; echo FP_OK` → `VM-0-2-opencloudos` / `FP_OK`） |
+| 添加会话表单渲染 | 通过（右侧抽屉，字段/私钥密码切换/保存取消按钮布局正常） |
+
 ## 下一步建议
 
-先做**会话库 + 主机指纹**，这两件是"能不能日常用"的门槛；SFTP 放之后再上。
-做会话库时顺手把侧栏从硬编码切成数据驱动，`open_ssh` 的入参就该换成 `&Session`。
+先做**断线重连**，这是最后一个"日常用不顺"的 P0：`Tab.session_id` 已经在，重连就是把 `open_session` 的建连部分抽出来复用 + 退避定时器。
+之后是 SFTP（复用同一连接开 subsystem）。

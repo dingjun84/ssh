@@ -1,4 +1,7 @@
+mod hostkey;
+mod secrets;
 mod ssh;
+mod store;
 
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
@@ -14,6 +17,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Mutex;
 
 use ssh::{Auth, SshEvent, SshRequest};
+use store::{AuthKind, Session, Store};
 
 const BG: Color = Color::from_rgb(0.118, 0.122, 0.110);
 const SIDEBAR: Color = Color::from_rgb(0.133, 0.137, 0.122);
@@ -111,26 +115,145 @@ impl Status {
 
 struct Tab {
     id: u64,
+    /// `None` for local shells, which never reconnect.
+    session_id: Option<i64>,
     title: String,
     term: Terminal,
     transport: Option<Arc<ssh::SshTransport>>,
     events: Option<Arc<Mutex<UnboundedReceiver<SshEvent>>>>,
     status: Status,
+    fingerprint: Option<String>,
+    /// Trust-on-first-use note shown next to the fingerprint.
+    fingerprint_note: Option<&'static str>,
 }
 
 struct App {
+    store: Store,
+    store_warning: Option<String>,
+    groups: Vec<(String, Vec<Session>)>,
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
+    /// `Some` while the "add session" drawer is open.
+    draft: Option<Draft>,
+    /// Session id awaiting delete confirmation.
+    pending_delete: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftField {
+    Group,
+    Label,
+    Host,
+    Port,
+    User,
+    KeyPath,
+    Secret,
+}
+
+#[derive(Debug, Clone)]
+struct Draft {
+    group: String,
+    label: String,
+    host: String,
+    port: String,
+    user: String,
+    use_key: bool,
+    key_path: String,
+    /// Password or key passphrase, depending on `use_key`.
+    secret: String,
+    error: Option<String>,
+}
+
+impl Draft {
+    fn new(group: Option<&str>) -> Self {
+        Draft {
+            group: group.unwrap_or("生产环境").to_string(),
+            label: String::new(),
+            host: String::new(),
+            port: "22".into(),
+            user: "root".into(),
+            use_key: true,
+            key_path: "~/.ssh/id_rsa".into(),
+            secret: String::new(),
+            error: None,
+        }
+    }
+
+    fn field_mut(&mut self, field: DraftField) -> &mut String {
+        match field {
+            DraftField::Group => &mut self.group,
+            DraftField::Label => &mut self.label,
+            DraftField::Host => &mut self.host,
+            DraftField::Port => &mut self.port,
+            DraftField::User => &mut self.user,
+            DraftField::KeyPath => &mut self.key_path,
+            DraftField::Secret => &mut self.secret,
+        }
+    }
+
+    /// Validates and converts into a store row; the label falls back to the
+    /// host so the sidebar never shows a blank line.
+    fn into_new_session(&self) -> Result<store::NewSession, String> {
+        let host = self.host.trim();
+        if host.is_empty() {
+            return Err("主机不能为空".into());
+        }
+        let port: u16 = self
+            .port
+            .trim()
+            .parse()
+            .map_err(|_| format!("端口不是合法数字: {}", self.port))?;
+        let user = self.user.trim();
+        if user.is_empty() {
+            return Err("用户不能为空".into());
+        }
+        let group = self.group.trim();
+        Ok(store::NewSession {
+            group: if group.is_empty() { "未分组" } else { group }.to_string(),
+            label: {
+                let label = self.label.trim();
+                if label.is_empty() {
+                    host.to_string()
+                } else {
+                    label.to_string()
+                }
+            },
+            host: host.to_string(),
+            port,
+            user: user.to_string(),
+            auth: if self.use_key {
+                let path = self.key_path.trim();
+                if path.is_empty() {
+                    return Err("私钥路径不能为空".into());
+                }
+                AuthKind::Key {
+                    path: path.to_string(),
+                }
+            } else {
+                AuthKind::Password
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
 enum Message {
     Term(iced_term::Event),
     Ssh(u64, SshEvent),
-    Open(&'static str),
+    /// Utility tabs that are not part of the session library.
+    OpenUtility(&'static str),
+    OpenSession(i64),
     SelectTab(usize),
     CloseTab(usize),
+    NewSession,
+    DraftEdited(DraftField, String),
+    DraftAuth(bool),
+    DraftSave,
+    DraftClose,
+    AskDelete(i64),
+    ConfirmDelete,
+    CancelDelete,
 }
 
 fn spawn_local(id: u64, program: &str, args: Vec<String>) -> Terminal {
@@ -144,34 +267,88 @@ fn spawn_local(id: u64, program: &str, args: Vec<String>) -> Terminal {
     Terminal::new(id, settings).expect("failed to create terminal")
 }
 
+/// Seed data for a fresh install: the box this project is developed against.
+fn seed_sessions() -> Vec<store::NewSession> {
+    vec![store::NewSession {
+        group: "生产环境".into(),
+        label: "43.139.142.161".into(),
+        host: "43.139.142.161".into(),
+        port: 22,
+        user: "root".into(),
+        auth: AuthKind::Key {
+            path: "~/.ssh/id_rsa".into(),
+        },
+    }]
+}
+
 impl App {
     fn boot() -> (Self, Task<Message>) {
+        let mut store_warning = None;
+        let store = match Store::open_default() {
+            Ok(store) => store,
+            Err(err) => {
+                // A broken database must not take the whole app down; run on an
+                // in-memory library so the user can still open ad-hoc tabs.
+                store_warning = Some(format!("{err}（已退化为临时会话库）"));
+                Store::open(std::path::Path::new(":memory:"))
+                    .expect("in-memory session store should always open")
+            },
+        };
+
+        if let Err(err) = store.seed_if_empty(&seed_sessions()) {
+            store_warning.get_or_insert(err);
+        }
+
+        let groups = store.groups().unwrap_or_default();
         let mut app = App {
+            store,
+            store_warning,
+            groups,
             tabs: Vec::new(),
             active: 0,
             next_id: 1,
+            draft: None,
+            pending_delete: None,
         };
+
         // Unattended smoke test hook: lets CI (and me) open a real session
         // without clicking through the UI.
         if std::env::var("SSH_AUTOCONNECT").is_ok() {
-            app.open_demo_host();
+            if let Some(first) = app.first_session_id() {
+                app.open_session(first);
+            }
         } else {
             app.open_local();
+        }
+
+        // Same idea for the session form, which otherwise needs a click.
+        if std::env::var("SSH_OPEN_FORM").is_ok() {
+            let group = app.groups.first().map(|(name, _)| name.clone());
+            app.draft = Some(Draft::new(group.as_deref()));
         }
         (app, Task::none())
     }
 
-    fn open_demo_host(&mut self) {
-        self.open_ssh(
-            "43.139.142.161",
-            "43.139.142.161",
-            22,
-            "root",
-            Auth::Key {
-                path: shellexpand("~/.ssh/id_rsa"),
-                passphrase: None,
-            },
-        );
+    fn first_session_id(&self) -> Option<i64> {
+        self.groups
+            .first()
+            .and_then(|(_, list)| list.first())
+            .map(|s| s.id)
+    }
+
+    fn reload_groups(&mut self) {
+        match self.store.groups() {
+            Ok(groups) => self.groups = groups,
+            Err(err) => self.store_warning = Some(err),
+        }
+    }
+
+    fn find_session(&self, id: i64) -> Option<Session> {
+        self.groups
+            .iter()
+            .flat_map(|(_, list)| list.iter())
+            .find(|s| s.id == id)
+            .cloned()
     }
 
     fn open_local(&mut self) {
@@ -180,11 +357,14 @@ impl App {
         self.next_id += 1;
         self.tabs.push(Tab {
             id,
+            session_id: None,
             title: "local".into(),
             term: spawn_local(id, &shell, vec![]),
             transport: None,
             events: None,
             status: Status::Local,
+            fingerprint: None,
+            fingerprint_note: None,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -220,6 +400,7 @@ sleep 1800
         self.next_id += 1;
         self.tabs.push(Tab {
             id,
+            session_id: None,
             title: "渲染自检".into(),
             term: spawn_local(
                 id,
@@ -229,20 +410,61 @@ sleep 1800
             transport: None,
             events: None,
             status: Status::Local,
+            fingerprint: None,
+            fingerprint_note: None,
         });
         self.active = self.tabs.len() - 1;
     }
 
-    fn open_ssh(&mut self, label: &str, host: &str, port: u16, user: &str, auth: Auth) {
+    fn open_session(&mut self, session_id: i64) {
+        // Focus the existing tab instead of stacking duplicates.
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|t| t.session_id == Some(session_id))
+        {
+            self.active = index;
+            return;
+        }
+
+        let Some(session) = self.find_session(session_id) else {
+            self.store_warning = Some(format!("会话 {session_id} 不在库中"));
+            return;
+        };
+
         let id = self.next_id;
         self.next_id += 1;
+
+        let mut error: Option<String> = None;
+        let auth = match &session.auth {
+            AuthKind::Key { path } => Auth::Key {
+                path: shellexpand(path),
+                passphrase: match secrets::passphrase(session.id) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error = Some(e);
+                        None
+                    },
+                },
+            },
+            AuthKind::Password => match secrets::password(session.id) {
+                Ok(Some(password)) => Auth::Password(password),
+                Ok(None) => {
+                    return self.open_failed(&session, "会话库里没有保存密码".into());
+                },
+                Err(e) => return self.open_failed(&session, e),
+            },
+        };
+        if let Some(err) = error {
+            return self.open_failed(&session, err);
+        }
 
         let (transport, rx) = ssh::spawn(
             &runtime(),
             SshRequest {
-                host: host.to_string(),
-                port,
-                user: user.to_string(),
+                host: session.host.clone(),
+                port: session.port,
+                user: session.user.clone(),
                 auth,
                 cols: 100,
                 rows: 30,
@@ -253,14 +475,52 @@ sleep 1800
 
         self.tabs.push(Tab {
             id,
-            title: label.to_string(),
+            session_id: Some(session.id),
+            title: session.label.clone(),
             term,
             transport: Some(transport),
             events: Some(Arc::new(Mutex::new(rx))),
             status: Status::Connecting,
+            fingerprint: None,
+            fingerprint_note: None,
+        });
+        self.active = self.tabs.len() - 1;
+        let _ = self.store.touch(session.id);
+
+    }
+
+    /// Opens a tab that shows nothing but the failure, so the reason is
+    /// visible instead of being swallowed by a silent no-op.
+    fn open_failed(&mut self, session: &Session, error: String) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut term = Terminal::new_remote(id, term_settings(), Arc::new(NullTransport));
+        term.feed(format!("\x1b[1;31m[无法连接] {error}\x1b[0m\r\n").as_bytes());
+        self.tabs.push(Tab {
+            id,
+            session_id: Some(session.id),
+            title: session.label.clone(),
+            term,
+            transport: None,
+            events: None,
+            status: Status::Failed(error),
+            fingerprint: None,
+            fingerprint_note: None,
         });
         self.active = self.tabs.len() - 1;
     }
+
+    fn tab_index_for(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+}
+
+/// Placeholder sink for tabs that never reach a host.
+struct NullTransport;
+
+impl Transport for NullTransport {
+    fn write(&self, _data: &[u8]) {}
+    fn resize(&self, _cols: u16, _rows: u16) {}
 }
 
 fn update(state: &mut App, message: Message) -> Task<Message> {
@@ -271,24 +531,24 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
             }
         },
         Message::Ssh(id, event) => {
-            if let Some(tab) = state.tabs.iter_mut().find(|t| t.id == id) {
+            if let Some(index) = state.tab_index_for(id) {
+                let tab = &mut state.tabs[index];
                 match event {
                     SshEvent::Data(bytes) => tab.term.feed(&bytes),
+                    SshEvent::HostKey { fingerprint, learned } => {
+                        tab.fingerprint = Some(fingerprint);
+                        tab.fingerprint_note = Some(if learned {
+                            "首次连接，已记录"
+                        } else {
+                            "与 known_hosts 一致"
+                        });
+                    },
                     SshEvent::Connected => {
                         tab.status = Status::Connected;
-                        // Unattended smoke test: SSH_PROBE feeds a command to the
-                        // remote shell right after login so the whole chain can be
-                        // verified without a keyboard.
-                        if let Ok(probe) = std::env::var("SSH_PROBE")
-                            && let Some(t) = &tab.transport
-                        {
-                            t.write(probe.as_bytes());
-                        }
                     },
                     SshEvent::Error(err) => {
                         tab.status = Status::Failed(err.clone());
-                        let message =
-                            format!("\r\n\x1b[1;31m[连接错误] {err}\x1b[0m\r\n");
+                        let message = format!("\r\n\x1b[1;31m[连接错误] {err}\x1b[0m\r\n");
                         tab.term.feed(message.as_bytes());
                     },
                     SshEvent::Closed => {
@@ -299,12 +559,12 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
                 }
             }
         },
-        Message::Open(target) => match target {
+        Message::OpenUtility(target) => match target {
             "local" => state.open_local(),
             "selftest" => state.open_selftest(),
-            "demo" => state.open_demo_host(),
             _ => {},
         },
+        Message::OpenSession(id) => state.open_session(id),
         Message::SelectTab(index) => {
             if index < state.tabs.len() {
                 state.active = index;
@@ -318,10 +578,91 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
                 }
             }
         },
+        Message::NewSession => {
+            let group = state.groups.first().map(|(name, _)| name.as_str());
+            state.draft = Some(Draft::new(group));
+            state.pending_delete = None;
+            return iced::widget::operation::focus(draft_input_id(DraftField::Label));
+        },
+        Message::DraftEdited(field, value) => {
+            if let Some(draft) = &mut state.draft {
+                *draft.field_mut(field) = value;
+            }
+        },
+        Message::DraftAuth(use_key) => {
+            if let Some(draft) = &mut state.draft {
+                draft.use_key = use_key;
+            }
+        },
+        Message::DraftSave => {
+            let Some(draft) = state.draft.clone() else {
+                return Task::none();
+            };
+            let new_session = match draft.into_new_session() {
+                Ok(session) => session,
+                Err(err) => {
+                    if let Some(draft) = &mut state.draft {
+                        draft.error = Some(err);
+                    }
+                    return Task::none();
+                },
+            };
+
+            let id = match state.store.insert(&new_session) {
+                Ok(id) => id,
+                Err(err) => {
+                    if let Some(draft) = &mut state.draft {
+                        draft.error = Some(err);
+                    }
+                    return Task::none();
+                },
+            };
+
+            // Secrets go to the Keychain, keyed by the row id we just got.
+            let secret_result = if draft.secret.is_empty() {
+                Ok(())
+            } else if draft.use_key {
+                secrets::set_passphrase(id, &draft.secret)
+            } else {
+                secrets::set_password(id, &draft.secret)
+            };
+            if let Err(err) = secret_result {
+                if let Some(draft) = &mut state.draft {
+                    draft.error = Some(err);
+                }
+                // The session row exists already; keep it so the user can fix
+                // the secret by re-saving instead of retyping everything.
+                state.reload_groups();
+                return Task::none();
+            }
+
+            state.draft = None;
+            state.reload_groups();
+        },
+        Message::DraftClose => state.draft = None,
+        Message::AskDelete(id) => state.pending_delete = Some(id),
+        Message::CancelDelete => state.pending_delete = None,
+        Message::ConfirmDelete => {
+            if let Some(id) = state.pending_delete.take() {
+                if let Err(err) = state.store.delete(id) {
+                    state.store_warning = Some(err);
+                } else {
+                    secrets::forget(id);
+                    // Close tabs that belong to the removed session.
+                    state.tabs.retain(|t| t.session_id != Some(id));
+                    if state.active >= state.tabs.len() {
+                        state.active = state.tabs.len().saturating_sub(1);
+                    }
+                    state.reload_groups();
+                }
+            }
+        },
     }
     Task::none()
 }
 
+/// Expands a leading `~/`, since our key paths come from the database rather
+/// than from a shell.
 fn shellexpand(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/")
         && let Some(home) = std::env::var_os("HOME")
@@ -389,35 +730,114 @@ fn subscription(state: &App) -> Subscription<Message> {
     Subscription::batch(subs)
 }
 
+/// Colour of the status dot next to a session, if that session is open.
+fn session_dot(state: &App, session_id: i64) -> Option<Color> {
+    state
+        .tabs
+        .iter()
+        .find(|t| t.session_id == Some(session_id))
+        .map(|t| t.status.color())
+}
+
 fn sidebar(state: &App) -> Element<'_, Message> {
     let mut col = column![].spacing(2).padding(10);
-    col = col.push(text("会话").size(11).color(DIM));
+
+    if let Some(warning) = &state.store_warning {
+        col = col.push(text(format!("⚠ {warning}")).size(10).color(DANGER));
+        col = col.push(container(text("")).height(Length::Fixed(6.0)));
+    }
+
+    if let Some(id) = state.pending_delete {
+        let name = state
+            .find_session(id)
+            .map(|s| s.label)
+            .unwrap_or_else(|| format!("#{id}"));
+        col = col.push(container(
+            column![
+                text(format!("删除「{name}」？")).size(11).color(FG),
+                text("密码也会从钥匙串移除").size(10).color(DIM),
+                row![
+                    button(text("确认删除").size(11).color(DANGER))
+                        .on_press(Message::ConfirmDelete)
+                        .padding([3, 8])
+                        .style(flat_button),
+                    button(text("取消").size(11).color(DIM))
+                        .on_press(Message::CancelDelete)
+                        .padding([3, 8])
+                        .style(flat_button),
+                ]
+                .spacing(4),
+            ]
+            .spacing(4),
+        )
+        .padding(6)
+        .style(|_| container::Style {
+            background: Some(Color::from_rgba(0.976, 0.149, 0.447, 0.12).into()),
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        col = col.push(container(text("")).height(Length::Fixed(6.0)));
+    }
+
+    for (group, sessions) in &state.groups {
+        col = col.push(
+            text(format!("{group} · {}", sessions.len()))
+                .size(11)
+                .color(DIM),
+        );
+        for session in sessions {
+            let dot = session_dot(state, session.id);
+            let label = row![
+                text("●")
+                    .size(8)
+                    .color(dot.unwrap_or(Color::TRANSPARENT)),
+                column![
+                    text(session.label.clone()).size(12).color(FG),
+                    text(session.subtitle()).size(10).color(DIM),
+                ]
+                .spacing(1),
+            ]
+            .spacing(6);
+
+            col = col.push(
+                row![
+                    button(label)
+                        .on_press(Message::OpenSession(session.id))
+                        .width(Length::Fill)
+                        .style(flat_button),
+                    button(text("×").size(11).color(DIM))
+                        .on_press(Message::AskDelete(session.id))
+                        .padding([2, 4])
+                        .style(ghost_button),
+                ]
+                .spacing(0)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        col = col.push(container(text("")).height(Length::Fixed(8.0)));
+    }
+
     col = col.push(
-        button(text("本地 shell").size(12).color(FG))
-            .on_press(Message::Open("local"))
+        button(text("＋ 添加会话").size(12).color(ACCENT))
+            .on_press(Message::NewSession)
+            .width(Length::Fill)
+            .style(flat_button),
+    );
+    col = col.push(container(text("")).height(Length::Fixed(6.0)));
+    col = col.push(
+        button(text("本地 shell").size(12).color(DIM))
+            .on_press(Message::OpenUtility("local"))
             .width(Length::Fill)
             .style(flat_button),
     );
     col = col.push(
         button(text("渲染自检").size(12).color(DIM))
-            .on_press(Message::Open("selftest"))
+            .on_press(Message::OpenUtility("selftest"))
             .width(Length::Fill)
             .style(flat_button),
-    );
-    col = col.push(container(text("")).height(Length::Fixed(8.0)));
-
-    col = col.push(text("生产环境 · 1").size(11).color(DIM));
-    col = col.push(
-        button(
-            column![
-                text("43.139.142.161").size(12).color(FG),
-                text("root · 私钥").size(10).color(DIM),
-            ]
-            .spacing(1),
-        )
-        .on_press(Message::Open("demo"))
-        .width(Length::Fill)
-        .style(flat_button),
     );
 
     col = col.push(container(text("")).height(Length::Fixed(12.0)));
@@ -435,6 +855,188 @@ fn sidebar(state: &App) -> Element<'_, Message> {
             ..Default::default()
         })
         .into()
+}
+
+fn draft_input_id(field: DraftField) -> iced::widget::Id {
+    iced::widget::Id::new(match field {
+        DraftField::Group => "draft-group",
+        DraftField::Label => "draft-label",
+        DraftField::Host => "draft-host",
+        DraftField::Port => "draft-port",
+        DraftField::User => "draft-user",
+        DraftField::KeyPath => "draft-key-path",
+        DraftField::Secret => "draft-secret",
+    })
+}
+
+fn input_field<'a>(
+    title: &'a str,
+    value: &'a str,
+    field: DraftField,
+    placeholder: &'a str,
+    secure: bool,
+) -> Element<'a, Message> {
+    let mut input = iced::widget::text_input(placeholder, value)
+        .id(draft_input_id(field))
+        .size(12)
+        .padding(6)
+        .on_input(move |v| Message::DraftEdited(field, v))
+        .style(dark_input);
+    if secure {
+        input = input.secure(true);
+    }
+    column![text(title).size(10).color(DIM), input]
+        .spacing(2)
+        .into()
+}
+
+fn dark_input(_theme: &iced::Theme, _status: iced::widget::text_input::Status) -> iced::widget::text_input::Style {
+    iced::widget::text_input::Style {
+        background: Color::from_rgb(0.075, 0.078, 0.070).into(),
+        border: iced::Border {
+            radius: 3.0.into(),
+            width: 1.0,
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.08),
+        },
+        icon: DIM,
+        placeholder: DIM,
+        value: FG,
+        selection: Color::from_rgba(0.651, 0.886, 0.180, 0.35),
+    }
+}
+
+fn form_panel(state: &App) -> Element<'_, Message> {
+    let Some(draft) = &state.draft else {
+        return container(text("")).into();
+    };
+
+    let auth_buttons = row![
+        button(text("私钥").size(11).color(if draft.use_key { BG } else { DIM }))
+            .on_press(Message::DraftAuth(true))
+            .padding([3, 10])
+            .style(move |theme, status| toggle_style(theme, status, draft.use_key)),
+        button(text("密码").size(11).color(if draft.use_key { DIM } else { BG }))
+            .on_press(Message::DraftAuth(false))
+            .padding([3, 10])
+            .style(move |theme, status| toggle_style(theme, status, !draft.use_key)),
+    ]
+    .spacing(2);
+
+    let mut col = column![
+        text("新建会话").size(12).color(FG),
+        input_field("名称（留空用主机名）", &draft.label, DraftField::Label, "prod-web-01", false),
+        input_field("主机", &draft.host, DraftField::Host, "10.0.0.1 或 example.com", false),
+        row![
+            column![
+                input_field("端口", &draft.port, DraftField::Port, "22", false)
+            ]
+            .width(Length::Fixed(64.0)),
+            column![
+                input_field("用户", &draft.user, DraftField::User, "root", false)
+            ]
+            .width(Length::Fill),
+        ]
+        .spacing(6),
+        input_field("分组", &draft.group, DraftField::Group, "生产环境", false),
+        text("认证").size(10).color(DIM),
+        auth_buttons,
+    ]
+    .spacing(8);
+
+    if draft.use_key {
+        col = col.push(input_field(
+            "私钥路径",
+            &draft.key_path,
+            DraftField::KeyPath,
+            "~/.ssh/id_ed25519",
+            false,
+        ));
+    }
+    col = col.push(input_field(
+        if draft.use_key {
+            "私钥口令（没有就留空）"
+        } else {
+            "密码（存入钥匙串）"
+        },
+        &draft.secret,
+        DraftField::Secret,
+        "••••••••",
+        !draft.use_key,
+    ));
+
+    if let Some(err) = &draft.error {
+        col = col.push(text(err.clone()).size(10).color(DANGER));
+    }
+
+    col = col.push(
+        row![
+            button(text("保存").size(11).color(BG))
+                .on_press(Message::DraftSave)
+                .padding([5, 14])
+                .style(primary_button),
+            button(text("取消").size(11).color(DIM))
+                .on_press(Message::DraftClose)
+                .padding([5, 10])
+                .style(flat_button),
+        ]
+        .spacing(4),
+    );
+
+    container(col)
+        .width(Length::Fixed(248.0))
+        .height(Length::Fill)
+        .padding(12)
+        .style(|_| container::Style {
+            background: Some(SIDEBAR.into()),
+            border: iced::Border {
+                width: 1.0,
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.06),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn primary_button(_theme: &iced::Theme, status: button::Status) -> button::Style {
+    let alpha = match status {
+        button::Status::Hovered | button::Status::Pressed => 0.85,
+        _ => 1.0,
+    };
+    button::Style {
+        background: Some(
+            Color {
+                a: alpha,
+                ..ACCENT
+            }
+            .into(),
+        ),
+        text_color: BG,
+        border: iced::Border {
+            radius: 3.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn toggle_style(_theme: &iced::Theme, _status: button::Status, on: bool) -> button::Style {
+    button::Style {
+        background: Some(
+            if on {
+                ACCENT
+            } else {
+                Color::from_rgba(1.0, 1.0, 1.0, 0.06)
+            }
+            .into(),
+        ),
+        text_color: FG,
+        border: iced::Border {
+            radius: 3.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 fn tabbar(state: &App) -> Element<'_, Message> {
@@ -485,19 +1087,32 @@ fn view(state: &App) -> Element<'_, Message> {
 
     let main = column![tabbar(state), terminal].height(Length::Fill);
 
-    let active_status = state.tabs.get(state.active).map(|t| &t.status);
-    let status_text = match active_status {
+    let mut body = row![sidebar(state), main].height(Length::Fill);
+    if state.draft.is_some() {
+        body = body.push(form_panel(state));
+    }
+
+    let active_tab = state.tabs.get(state.active);
+    let status_text = match active_tab.map(|t| &t.status) {
         Some(Status::Failed(err)) => err.clone(),
         Some(status) => status.label().to_string(),
         None => "—".to_string(),
     };
+    let fingerprint = active_tab
+        .and_then(|t| t.fingerprint.clone())
+        .unwrap_or_else(|| "未校验".to_string());
+    let fingerprint_note = active_tab
+        .and_then(|t| t.fingerprint_note)
+        .unwrap_or("");
 
     let status = container(
         row![
             text("●")
                 .size(9)
-                .color(active_status.map(Status::color).unwrap_or(DIM)),
+                .color(active_tab.map(|t| t.status.color()).unwrap_or(DIM)),
             text(status_text).size(10).color(FG),
+            text(fingerprint).size(10).color(DIM),
+            text(fingerprint_note).size(10).color(ACCENT),
             text("keepalive 30s / max 4").size(10).color(DIM),
             text("alacritty 0.25 · iced 0.14").size(10).color(DIM),
         ]
@@ -511,10 +1126,7 @@ fn view(state: &App) -> Element<'_, Message> {
         ..Default::default()
     });
 
-    container(column![
-        row![sidebar(state), main].height(Length::Fill),
-        status
-    ])
+    container(column![body, status])
     .width(Length::Fill)
     .height(Length::Fill)
     .style(|_| container::Style {
