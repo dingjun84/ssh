@@ -98,13 +98,16 @@ mod tests {
 
     struct TempDir(PathBuf);
 
+    /// Same reason as in `store::tests`: timestamp-only names collide when
+    /// tests run in parallel, and one test would then delete another's
+    /// known_hosts mid-run.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     impl TempDir {
         fn new() -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("ssh-client-hostkey-{nanos}"));
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let path = std::env::temp_dir()
+                .join(format!("ssh-client-hostkey-{}-{seq}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
             TempDir(path)
         }

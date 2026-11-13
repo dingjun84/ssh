@@ -332,16 +332,20 @@ fn db_path() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct TempDir(PathBuf);
 
+    /// `SystemTime` on macOS only has microsecond resolution, so two tests
+    /// starting at once could pick the same directory and then delete each
+    /// other's database. A process-local counter keeps them apart.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     impl TempDir {
         fn new() -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("ssh-client-store-{nanos}"));
+            let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir()
+                .join(format!("ssh-client-store-{}-{seq}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
             TempDir(path)
         }
