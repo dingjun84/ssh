@@ -99,6 +99,8 @@ impl Terminal {
     /// Pushes bytes received from the remote host through the VT parser.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.backend.feed(bytes);
+        // Views read a snapshot, so publish the parsed state before redrawing.
+        self.backend.sync();
         self.redraw();
     }
 
@@ -198,4 +200,72 @@ fn terminal_subscription_stream(
         }
     })
     .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::index::{Column, Line, Point};
+    use alacritty_terminal::term::TermMode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        resizes: AtomicUsize,
+    }
+
+    impl backend::Transport for RecordingTransport {
+        fn write(&self, _: &[u8]) {}
+
+        fn resize(&self, _: u16, _: u16) {
+            self.resizes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn feed_updates_rendered_text_without_user_input() {
+        let mut terminal = Terminal::new_remote(
+            1, Settings::default(), Arc::new(RecordingTransport::default()),
+        );
+        terminal.backend.handle(backend::Command::Resize(
+            Some(iced_core::Size::new(800.0, 240.0)),
+            Some(iced_core::Size::new(10.0, 20.0)),
+        ));
+
+        for (bytes, expected) in [
+            (b"hello".as_slice(), "hello"),
+            (b" world".as_slice(), "hello world"),
+        ] {
+            terminal.feed(bytes);
+
+            let content = terminal.backend.renderable_content();
+            let actual: String = (0..expected.len())
+                .map(|col| content.grid[Point::new(Line(0), Column(col))].c)
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn feed_updates_terminal_modes_without_resizing_transport() {
+        let transport = Arc::new(RecordingTransport::default());
+        let mut terminal = Terminal::new_remote(
+            1, Settings::default(), transport.clone(),
+        );
+        let initial_resizes = transport.resizes.load(Ordering::Relaxed);
+
+        for (bytes, enabled) in [
+            (b"\x1b[?2004h".as_slice(), true),
+            (b"\x1b[?2004l".as_slice(), false),
+        ] {
+            terminal.feed(bytes);
+            assert_eq!(
+                terminal.backend.renderable_content().terminal_mode
+                    .contains(TermMode::BRACKETED_PASTE),
+                enabled,
+            );
+        }
+
+        assert_eq!(transport.resizes.load(Ordering::Relaxed), initial_resizes);
+    }
 }

@@ -973,7 +973,6 @@ mod tests {
         fn command_v_uses_event_modifiers_and_negotiated_paste_mode() {
             let mut term = terminal();
             term.feed(b"\x1b[?2004h");
-            term.backend.sync();
             let view = TerminalView { term: &term };
             let mut state = TerminalViewState::new(); // no ModifiersChanged
             let mut clipboard = Clipboard(Some("echo 中文\n".into()));

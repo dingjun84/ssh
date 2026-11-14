@@ -203,6 +203,7 @@ async fn expect_listing(
 ) -> Result<Vec<sftp::Entry>, String> {
     loop {
         match next(events).await? {
+            sftp::SftpEvent::Overwrite(c) => { if let Some(tx) = c.reply.lock().unwrap().take() { let _ = tx.send(true); } },
             sftp::SftpEvent::Listing { path, entries } => {
                 println!("   列表 {path} 返回 {} 项", entries.len());
                 return Ok(entries);
@@ -217,6 +218,7 @@ async fn expect_listing(
 async fn expect_done(events: &mut UnboundedReceiver<sftp::SftpEvent>) -> Result<(), String> {
     loop {
         match next(events).await? {
+            sftp::SftpEvent::Overwrite(c) => { if let Some(tx) = c.reply.lock().unwrap().take() { let _ = tx.send(true); } },
             sftp::SftpEvent::Done(message) => {
                 println!("   {message}");
                 return Ok(());
@@ -234,6 +236,7 @@ async fn expect_done_counting(
     let mut ticks = 0;
     loop {
         match next(events).await? {
+            sftp::SftpEvent::Overwrite(c) => { if let Some(tx) = c.reply.lock().unwrap().take() { let _ = tx.send(true); } },
             sftp::SftpEvent::Progress { done, total, .. } => {
                 ticks += 1;
                 if ticks == 1 || done == total {
@@ -253,6 +256,7 @@ async fn expect_done_counting(
 async fn expect_error(events: &mut UnboundedReceiver<sftp::SftpEvent>) -> Result<String, String> {
     loop {
         match next(events).await? {
+            sftp::SftpEvent::Overwrite(c) => { if let Some(tx) = c.reply.lock().unwrap().take() { let _ = tx.send(true); } },
             sftp::SftpEvent::Error(err) => return Ok(err),
             sftp::SftpEvent::Done(message) => {
                 return Err(format!("本应失败却成功了: {message}"));
