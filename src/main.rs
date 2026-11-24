@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use iced::font::Font;
-use iced::widget::{button, column, container, row, text};
+use iced::widget::{button, column, container, mouse_area, row, stack, text};
 use iced::{Color, Element, Length, Subscription, Task};
 use iced_term::settings::{
     BackendSettings, FontSettings, Settings as TermSettings, ThemeSettings,
@@ -169,6 +169,26 @@ struct App {
     pending_delete: Option<i64>,
     main_window: Option<iced::window::Id>,
     modifiers: iced::keyboard::Modifiers,
+    /// Last known window size, used to keep context menus on screen.
+    window_size: iced::Size,
+    /// Last known cursor position in window coordinates. Right-click events
+    /// carry no position, so the popup anchors to the last move.
+    cursor: iced::Point,
+    menu: Option<ContextMenu>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuTarget {
+    Session(i64),
+    /// Copies the current selection of this tab's terminal.
+    Terminal(u64),
+}
+
+#[derive(Debug, Clone)]
+struct ContextMenu {
+    target: MenuTarget,
+    /// Window-space point where the right click happened.
+    anchor: iced::Point,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +339,13 @@ enum Message {
     AskDelete(i64),
     ConfirmDelete,
     CancelDelete,
+    /// Right click on a sidebar session.
+    SessionMenu(i64),
+    /// Right click on the terminal output area.
+    TerminalMenu(u64),
+    CopySelection,
+    CloseMenu,
+    CursorMoved(iced::Point),
     /// Backoff timer fired for a tab.
     Reconnect(u64),
     /// User pressed the status-bar retry button.
@@ -403,6 +430,9 @@ impl App {
             pending_delete: None,
             main_window: None,
             modifiers: Default::default(),
+            window_size: iced::Size::new(1280.0, 800.0),
+            cursor: iced::Point::ORIGIN,
+            menu: None,
         };
 
         // Unattended smoke test hook: lets CI (and me) open a real session
@@ -847,6 +877,9 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
         Message::WindowOpened => {},
         Message::Modifiers(m) => state.modifiers = m,
         Message::Window(id, event) => match event {
+            iced::window::Event::Resized(size) if state.main_window == Some(id) => {
+                state.window_size = size;
+            },
             iced::window::Event::FileDropped(local) => {
                 if let Some(tab) = state.tabs.iter_mut().find(|t| t.sftp_ui.window == Some(id)) {
                     if let Some(name) = local.file_name().and_then(|n| n.to_str()) {
@@ -1035,14 +1068,52 @@ fn update(state: &mut App, message: Message) -> Task<Message> {
         },
         Message::DraftClose => state.draft = None,
         Message::EditSession(id) => {
+            state.menu = None;
             if let Some(session) = state.find_session(id) {
                 state.draft = Some(Draft::from_session(&session));
                 state.pending_delete = None;
                 return iced::widget::operation::focus(draft_input_id(DraftField::Label));
             }
         },
-        Message::AskDelete(id) => state.pending_delete = Some(id),
+        Message::AskDelete(id) => {
+            state.pending_delete = Some(id);
+            state.menu = None;
+        },
         Message::CancelDelete => state.pending_delete = None,
+        Message::CursorMoved(position) => state.cursor = position,
+        Message::SessionMenu(id) => {
+            state.menu = Some(ContextMenu {
+                target: MenuTarget::Session(id),
+                anchor: state.cursor,
+            });
+        },
+        Message::TerminalMenu(id) => {
+            // No selection, no menu: the only action on offer is copy. A right
+            // click elsewhere still dismisses whatever popup was open.
+            let has_selection = state
+                .tabs
+                .iter()
+                .find(|t| t.id == id)
+                .is_some_and(|t| !t.term.selection().is_empty());
+            state.menu = has_selection.then(|| ContextMenu {
+                target: MenuTarget::Terminal(id),
+                anchor: state.cursor,
+            });
+        },
+        Message::CopySelection => {
+            if let Some(ContextMenu {
+                target: MenuTarget::Terminal(id),
+                ..
+            }) = state.menu.take()
+                && let Some(tab) = state.tabs.iter().find(|t| t.id == id)
+            {
+                let selected = tab.term.selection();
+                if !selected.is_empty() {
+                    return iced::clipboard::write(selected);
+                }
+            }
+        },
+        Message::CloseMenu => state.menu = None,
         Message::ConfirmDelete => {
             if let Some(id) = state.pending_delete.take() {
                 if let Err(err) = state.store.delete(id) {
@@ -1223,7 +1294,10 @@ fn subscription(state: &App) -> Subscription<Message> {
 
     subs.push(iced::window::events().map(|(id,event)| Message::Window(id,event)));
     subs.push(iced::event::listen_with(|event,_,_| match event {
-        iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => Some(Message::Modifiers(m)), _ => None,
+        iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => Some(Message::Modifiers(m)),
+        // Right clicks carry no position, so remember where the cursor was.
+        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => Some(Message::CursorMoved(position)),
+        _ => None,
     }));
 
     Subscription::batch(subs)
@@ -1301,23 +1375,26 @@ fn sidebar(state: &App) -> Element<'_, Message> {
             ]
             .spacing(6);
 
+            let entry = row![
+                button(label)
+                    .on_press(Message::OpenSession(session.id))
+                    .width(Length::Fill)
+                    .style(flat_button),
+                button(text("✎").size(10).color(DIM))
+                    .on_press(Message::EditSession(session.id))
+                    .padding([2, 3])
+                    .style(ghost_button),
+                button(text("×").size(11).color(DIM))
+                    .on_press(Message::AskDelete(session.id))
+                    .padding([2, 3])
+                    .style(ghost_button),
+            ]
+            .spacing(0)
+            .align_y(iced::Alignment::Center);
+
+            // Right click opens the edit/delete popup at the cursor.
             col = col.push(
-                row![
-                    button(label)
-                        .on_press(Message::OpenSession(session.id))
-                        .width(Length::Fill)
-                        .style(flat_button),
-                    button(text("✎").size(10).color(DIM))
-                        .on_press(Message::EditSession(session.id))
-                        .padding([2, 3])
-                        .style(ghost_button),
-                    button(text("×").size(11).color(DIM))
-                        .on_press(Message::AskDelete(session.id))
-                        .padding([2, 3])
-                        .style(ghost_button),
-                ]
-                .spacing(0)
-                .align_y(iced::Alignment::Center),
+                mouse_area(entry).on_right_press(Message::SessionMenu(session.id)),
             );
         }
         col = col.push(container(text("")).height(Length::Fixed(8.0)));
@@ -1607,7 +1684,11 @@ fn view(state: &App, window: iced::window::Id) -> Element<'_, Message> {
         return files::view(&tab.sftp_ui).map(move |m| Message::Files(tab.id,m));
     }
     let terminal: Element<'_, Message> = if let Some(tab) = state.tabs.get(state.active) {
-        TerminalView::show(&tab.term).map(Message::Term)
+        // Selecting text is the terminal widget's job; right click on top of
+        // the selection opens the copy menu.
+        mouse_area(TerminalView::show(&tab.term).map(Message::Term))
+            .on_right_press(Message::TerminalMenu(tab.id))
+            .into()
     } else {
         container(text("没有打开的会话").size(12).color(DIM))
             .width(Length::Fill)
@@ -1677,20 +1758,118 @@ fn view(state: &App, window: iced::window::Id) -> Element<'_, Message> {
         ..Default::default()
     });
 
-    container(column![body, status])
+    let base: Element<'_, Message> = container(column![body, status])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(BG.into()),
+            ..Default::default()
+        })
+        .into();
+
+    if state.menu.is_none() {
+        return base;
+    }
+
+    stack![
+        base,
+        // Clicking anywhere outside the popup dismisses it. Sitting between
+        // the base layer and the panel keeps the rest of the UI from acting on
+        // that same click.
+        mouse_area(container(text("")).width(Length::Fill).height(Length::Fill))
+            .on_press(Message::CloseMenu),
+        context_menu(state),
+    ]
     .width(Length::Fill)
     .height(Length::Fill)
-    .style(|_| container::Style {
-        background: Some(BG.into()),
-        ..Default::default()
-    })
     .into()
+}
+
+/// The right-click popup, anchored at the cursor and pushed inside the window
+/// edges so it never renders half off-screen.
+fn context_menu(state: &App) -> Element<'_, Message> {
+    let Some(menu) = &state.menu else {
+        return container(text("")).into();
+    };
+
+    let items: Vec<Element<'_, Message>> = match menu.target {
+        MenuTarget::Session(id) => vec![
+            menu_item("修改", Message::EditSession(id), FG),
+            menu_item("删除", Message::AskDelete(id), DANGER),
+        ],
+        MenuTarget::Terminal(_) => vec![menu_item("复制", Message::CopySelection, FG)],
+    };
+
+    let panel = container(column(items).spacing(1))
+        .padding(4)
+        .width(Length::Fixed(132.0))
+        .style(|_| container::Style {
+            background: Some(Color::from_rgb(0.165, 0.169, 0.153).into()),
+            border: iced::Border {
+                radius: 6.0.into(),
+                width: 1.0,
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.12),
+            },
+            shadow: iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 12.0,
+            },
+            ..Default::default()
+        });
+
+    let x = menu
+        .anchor
+        .x
+        .min((state.window_size.width - 140.0).max(0.0));
+    let y = menu
+        .anchor
+        .y
+        .min((state.window_size.height - 100.0).max(0.0));
+
+    container(panel)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(iced::Padding {
+            top: y,
+            right: 0.0,
+            bottom: 0.0,
+            left: x,
+        })
+        .into()
+}
+
+fn menu_item<'a>(label: &'a str, message: Message, color: Color) -> Element<'a, Message> {
+    button(text(label).size(12).color(color))
+        .on_press(message)
+        .width(Length::Fill)
+        .padding([5, 10])
+        .style(menu_item_style)
+        .into()
 }
 
 fn flat_button(_theme: &iced::Theme, status: button::Status) -> button::Style {
     let bg = match status {
         button::Status::Hovered | button::Status::Pressed => {
             Some(Color::from_rgba(1.0, 1.0, 1.0, 0.07))
+        },
+        _ => None,
+    };
+    button::Style {
+        background: bg.map(Into::into),
+        text_color: FG,
+        border: iced::Border {
+            radius: 3.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn menu_item_style(_theme: &iced::Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered | button::Status::Pressed => {
+            Some(Color::from_rgba(0.651, 0.886, 0.180, 0.16))
         },
         _ => None,
     };

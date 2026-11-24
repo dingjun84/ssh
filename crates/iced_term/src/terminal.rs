@@ -113,6 +113,13 @@ impl Terminal {
         self.backend.set_transport(transport);
     }
 
+    /// Text currently selected in the grid, empty when nothing is selected.
+    /// The host application uses this to offer a "copy" action in its own
+    /// context menu.
+    pub fn selection(&self) -> String {
+        self.backend.selectable_content()
+    }
+
     pub fn subscription(&self) -> Subscription<Event> {
         let data = TerminalSubscriptionData {
             id: self.id,
